@@ -166,7 +166,7 @@ final class WiretapMiddleware
                         }
 
                         if ($reason instanceof \Throwable) {
-                            $pending->error(TransferError::fromThrowable($reason));
+                            $pending->error($this->errorFor($reason));
                         }
 
                         $this->commit($pending);
@@ -218,6 +218,33 @@ final class WiretapMiddleware
         };
 
         return $options;
+    }
+
+    /**
+     * Turn a rejection reason into a transport error, or nothing.
+     *
+     * Guzzle embeds the first 120 bytes of the response body verbatim in a
+     * BadResponseException message. Storing that message put the raw body into
+     * error.message, where neither the configured body-path rules nor the
+     * content-type gate apply — so a 422 whose JSON body was correctly
+     * redacted in responseBody appeared in full a few fields later.
+     *
+     * A response means this is an HTTP error, not a transport failure. The
+     * status already says so, so only the exception class is kept.
+     */
+    private function errorFor(\Throwable $reason): TransferError
+    {
+        if ($reason instanceof RequestException && $reason->getResponse() !== null) {
+            $response = $reason->getResponse();
+
+            return new TransferError(
+                errno: 0,
+                message: sprintf('HTTP %d response', $response->getStatusCode()),
+                class: $reason::class,
+            );
+        }
+
+        return TransferError::fromThrowable($reason);
     }
 
     private function commit(PendingExchange $pending): void

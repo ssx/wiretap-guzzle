@@ -528,3 +528,109 @@ describe('unknown-length bodies', function (): void {
             ->and($captured->truncated)->toBeTrue();
     });
 });
+
+describe('error messages on an HTTP error response', function (): void {
+    it('does not carry the raw response body into error.message', function (): void {
+        // Guzzle embeds the first 120 bytes of the response body verbatim in a
+        // BadResponseException message. Storing that message put the raw body
+        // into error.message, where neither the configured body-path rules nor
+        // the content-type gate apply — so a 422 whose JSON body was correctly
+        // redacted in responseBody appeared in full a few fields later.
+        $sink = new InMemorySink();
+        $recorder = new Recorder(
+            sink: $sink,
+            redactor: new \Ssx\Wiretap\Redaction\Redactor(
+                new \Ssx\Wiretap\Redaction\RedactionConfig(bodyPaths: ['password', 'ssn']),
+            ),
+        );
+
+        $stack = HandlerStack::create(new MockHandler([
+            new Response(422, ['Content-Type' => 'application/json'],
+                '{"password":"ordinary-secret-value","ssn":"078-05-1120"}'),
+        ]));
+        Stack::attach($stack, $recorder);
+
+        try {
+            (new Client(['handler' => $stack]))->get('https://api.example.com/v1');
+        } catch (\Throwable) {
+            // http_errors is on by default.
+        }
+
+        $recorder->flush();
+        $written = json_encode($sink->all());
+
+        expect($written)->not->toContain('ordinary-secret-value')
+            ->and($written)->not->toContain('078-05-1120')
+            ->and($sink->all()[0]->status)->toBe(422);
+    });
+
+    it('still records the exception class and the status', function (): void {
+        $sink = new InMemorySink();
+        $recorder = new Recorder(sink: $sink);
+
+        $stack = HandlerStack::create(new MockHandler([new Response(500, [], 'boom')]));
+        Stack::attach($stack, $recorder);
+
+        try {
+            (new Client(['handler' => $stack]))->get('https://api.example.com/v1');
+        } catch (\Throwable) {
+        }
+
+        $recorder->flush();
+        $error = $sink->all()[0]->error;
+
+        expect($error)->not->toBeNull()
+            ->and($error->class)->toContain('ServerException')
+            ->and($error->message)->toContain('500');
+    });
+
+    it('keeps the full message for a genuine transport failure', function (): void {
+        // No response means no body to leak, and the message is the only
+        // description of what went wrong.
+        $sink = new InMemorySink();
+        $recorder = new Recorder(sink: $sink);
+
+        $stack = HandlerStack::create(new MockHandler([
+            new \GuzzleHttp\Exception\ConnectException(
+                'Connection refused',
+                new Request('GET', 'https://api.example.com/v1'),
+            ),
+        ]));
+        Stack::attach($stack, $recorder);
+
+        try {
+            (new Client(['handler' => $stack]))->get('https://api.example.com/v1');
+        } catch (\Throwable) {
+        }
+
+        $recorder->flush();
+
+        expect($sink->all()[0]->error?->message)->toContain('Connection refused');
+    });
+
+    it('clears an earlier attempt error when a later one succeeds', function (): void {
+        // stats() set the errno and nothing cleared it, so every request
+        // retried after a connection failure read as failed — backwards for
+        // always-keep-failures sampling.
+        $sink = new InMemorySink();
+        $recorder = new Recorder(sink: $sink);
+
+        $stack = HandlerStack::create(new MockHandler([
+            new \GuzzleHttp\Exception\ConnectException('refused', new Request('GET', 'https://api.example.com/v1')),
+            new Response(200, [], 'recovered'),
+        ]));
+        $stack->push(\GuzzleHttp\Middleware::retry(
+            static fn (int $retries, $req, $res, $err): bool => $retries < 1 && $err !== null,
+        ));
+        Stack::attach($stack, $recorder);
+
+        (new Client(['handler' => $stack]))->get('https://api.example.com/v1');
+        $recorder->flush();
+
+        $exchange = $sink->all()[0];
+
+        expect($exchange->status)->toBe(200)
+            ->and($exchange->error)->toBeNull()
+            ->and($exchange->failed())->toBeFalse();
+    });
+});
