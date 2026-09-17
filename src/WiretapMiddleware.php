@@ -80,43 +80,81 @@ final class WiretapMiddleware
     public function __invoke(callable $next): callable
     {
         return function (RequestInterface $request, array $options) use ($next): PromiseInterface {
-            $url = (string) $request->getUri();
-
-            // The gate runs before anything is read. A blocked payload should
-            // never exist in process memory, not merely never be stored.
-            if (!$this->recorder()->shouldCapture($url)) {
+            try {
+                $prepared = $this->prepare($request, $options);
+            } catch (\Throwable) {
+                // Capture setup failed — a body whose getSize() throws, for
+                // instance. Send the request uninstrumented rather than let
+                // instrumentation stop it.
                 return $next($request, $options);
             }
 
-            $streaming = (bool) ($options['stream'] ?? false);
+            if ($prepared === null) {
+                return $next($request, $options);
+            }
 
-            $pending = new PendingExchange(
-                id: Ulid::generate(),
-                correlationId: Correlation::id(),
-                sequence: Correlation::nextSequence(),
-                method: $request->getMethod(),
-                uri: $url,
-                requestHeaders: Headers::fromMap($request->getHeaders()),
-                requestBody: $this->bodyCapture->capture(
-                    $request->getBody(),
-                    $request->getHeaderLine('Content-Type') ?: null,
-                ),
-                startedAt: microtime(true),
-            );
-            $pending->streaming = $streaming;
+            [$pending, $options] = $prepared;
 
-            $options = $this->chainStatsHandler($options, $pending);
+            return $this->dispatch($next, $request, $options, $pending);
+        };
+    }
 
-            return $next($request, $options)->then(
-                function (ResponseInterface $response) use ($pending): ResponseInterface {
+    /**
+     * @param array<string, mixed> $options
+     *
+     * @return array{0: PendingExchange, 1: array<string, mixed>}|null
+     */
+    private function prepare(RequestInterface $request, array $options): ?array
+    {
+        $url = (string) $request->getUri();
+
+        // The gate runs before anything is read. A blocked payload should
+        // never exist in process memory, not merely never be stored.
+        if (!$this->recorder()->shouldCapture($url)) {
+            return null;
+        }
+
+        $streaming = (bool) ($options['stream'] ?? false);
+
+        $pending = new PendingExchange(
+            id: Ulid::generate(),
+            correlationId: Correlation::id(),
+            sequence: Correlation::nextSequence(),
+            method: $request->getMethod(),
+            uri: $url,
+            requestHeaders: Headers::fromMap($request->getHeaders()),
+            requestBody: $this->bodyCapture->capture(
+                $request->getBody(),
+                $request->getHeaderLine('Content-Type') ?: null,
+            ),
+            startedAt: microtime(true),
+        );
+        $pending->streaming = $streaming;
+
+        return [$pending, $this->chainStatsHandler($options, $pending)];
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     */
+    private function dispatch(callable $next, RequestInterface $request, array $options, PendingExchange $pending): PromiseInterface
+    {
+        return $next($request, $options)->then(
+            function (ResponseInterface $response) use ($pending): ResponseInterface {
+                // Every line here is wrapped: a capture failure must not
+                // turn a successful response into a rejected promise.
+                try {
                     if (!$pending->isRecorded()) {
                         $pending->response($response, $this->captureResponseBody($response, $pending->streaming));
                         $this->commit($pending);
                     }
+                } catch (\Throwable) {
+                }
 
-                    return $response;
-                },
-                function (mixed $reason) use ($pending): PromiseInterface {
+                return $response;
+            },
+            function (mixed $reason) use ($pending): PromiseInterface {
+                try {
                     if (!$pending->isRecorded()) {
                         if ($reason instanceof RequestException && $reason->getResponse() !== null) {
                             $response = $reason->getResponse();
@@ -129,13 +167,16 @@ final class WiretapMiddleware
 
                         $this->commit($pending);
                     }
+                } catch (\Throwable) {
+                    // Must not replace the application's own failure with
+                    // an instrumentation one.
+                }
 
-                    // Returning anything but a rejection here would turn a
-                    // failure into a success and break the calling code.
-                    return Create::rejectionFor($reason);
-                },
-            );
-        };
+                // Returning anything but a rejection here would turn a
+                // failure into a success and break the calling code.
+                return Create::rejectionFor($reason);
+            },
+        );
     }
 
     /**
@@ -152,17 +193,17 @@ final class WiretapMiddleware
 
         $options['on_stats'] = function (TransferStats $stats) use ($existing, $pending): void {
             try {
+                // Stats only. Committing here recorded the wrong exchange:
+                // on_stats fires once per transfer, so a 302 that Guzzle was
+                // about to follow was committed as the finished exchange, and
+                // the 200 the application actually received was discarded as a
+                // duplicate. Retry middleware has the same shape.
+                //
+                // The cost is that a promise nobody ever waits on — a Pool
+                // whose results are discarded — is no longer recorded. That is
+                // a smaller problem than confidently recording a redirect hop
+                // as the response.
                 $pending->stats($stats);
-
-                $response = $stats->getResponse();
-
-                if ($response !== null) {
-                    $pending->response($response, $this->captureResponseBody($response, $pending->streaming));
-                    $this->commit($pending);
-                }
-
-                // With no response this is a transport failure. The rejection
-                // handler has the exception, so leave the record to it.
             } catch (\Throwable) {
                 // Instrumentation must never change application behaviour.
             }
