@@ -22,7 +22,7 @@ final class Stack
      *
      *     $client = new Client(['handler' => Stack::wrap($recorder)]);
      */
-    public static function wrap(Recorder $recorder, ?HandlerStack $stack = null, ?BodyCapture $bodyCapture = null): HandlerStack
+    public static function wrap(Recorder|\Closure $recorder, ?HandlerStack $stack = null, ?BodyCapture $bodyCapture = null): HandlerStack
     {
         return self::attach($stack ?? HandlerStack::create(), $recorder, $bodyCapture);
     }
@@ -36,7 +36,7 @@ final class Stack
      * signs the request or sets Content-Length, and it must never wrap the
      * request body. See WiretapMiddleware.
      */
-    public static function attach(HandlerStack $stack, Recorder $recorder, ?BodyCapture $bodyCapture = null): HandlerStack
+    public static function attach(HandlerStack $stack, Recorder|\Closure $recorder, ?BodyCapture $bodyCapture = null): HandlerStack
     {
         // Attaching twice would record every exchange twice.
         if (self::isAttached($stack)) {

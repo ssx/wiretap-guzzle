@@ -40,15 +40,41 @@ use Ssx\Wiretap\TransferError;
  */
 final class WiretapMiddleware
 {
+    /** @var \Closure(): Recorder */
+    private readonly \Closure $resolveRecorder;
+
+    /**
+     * The recorder may be passed directly, or as a closure resolved per call.
+     *
+     * The closure form matters more than it looks. Middleware is pushed onto a
+     * handler stack once, at boot, and a stack is frequently built before the
+     * application has finished deciding what its recorder should be — a test
+     * calling Wiretap::fake() afterwards, for instance. Holding a fixed
+     * instance means those later decisions are silently ignored and the
+     * records go somewhere nobody is looking.
+     *
+     * @param Recorder|\Closure(): Recorder $recorder
+     */
     public function __construct(
-        private readonly Recorder $recorder,
+        Recorder|\Closure $recorder,
         private readonly BodyCapture $bodyCapture = new BodyCapture(),
     ) {
+        $this->resolveRecorder = $recorder instanceof Recorder
+            ? static fn (): Recorder => $recorder
+            : $recorder;
     }
 
-    public static function create(Recorder $recorder, ?BodyCapture $bodyCapture = null): self
+    /**
+     * @param Recorder|\Closure(): Recorder $recorder
+     */
+    public static function create(Recorder|\Closure $recorder, ?BodyCapture $bodyCapture = null): self
     {
         return new self($recorder, $bodyCapture ?? new BodyCapture());
+    }
+
+    private function recorder(): Recorder
+    {
+        return ($this->resolveRecorder)();
     }
 
     public function __invoke(callable $next): callable
@@ -58,7 +84,7 @@ final class WiretapMiddleware
 
             // The gate runs before anything is read. A blocked payload should
             // never exist in process memory, not merely never be stored.
-            if (!$this->recorder->shouldCapture($url)) {
+            if (!$this->recorder()->shouldCapture($url)) {
                 return $next($request, $options);
             }
 
@@ -152,7 +178,7 @@ final class WiretapMiddleware
     private function commit(PendingExchange $pending): void
     {
         if ($pending->markRecorded()) {
-            $this->recorder->record($pending->toExchange());
+            $this->recorder()->record($pending->toExchange());
         }
     }
 
