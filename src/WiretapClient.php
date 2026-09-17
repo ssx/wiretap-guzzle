@@ -27,18 +27,32 @@ use Ssx\Wiretap\TransferError;
  */
 final readonly class WiretapClient implements ClientInterface
 {
+    /** @var \Closure(): Recorder */
+    private \Closure $resolveRecorder;
+
+    /**
+     * @param Recorder|\Closure(): Recorder $recorder See WiretapMiddleware
+     */
     public function __construct(
         private ClientInterface $inner,
-        private Recorder $recorder,
+        Recorder|\Closure $recorder,
         private BodyCapture $bodyCapture = new BodyCapture(),
     ) {
+        $this->resolveRecorder = $recorder instanceof Recorder
+            ? static fn (): Recorder => $recorder
+            : $recorder;
+    }
+
+    private function recorder(): Recorder
+    {
+        return ($this->resolveRecorder)();
     }
 
     public function sendRequest(RequestInterface $request): ResponseInterface
     {
         $url = (string) $request->getUri();
 
-        if (!$this->recorder->shouldCapture($url)) {
+        if (!$this->recorder()->shouldCapture($url)) {
             return $this->inner->sendRequest($request);
         }
 
@@ -83,7 +97,7 @@ final readonly class WiretapClient implements ClientInterface
         ?TransferError $error,
     ): void {
         try {
-            $this->recorder->record(new Exchange(
+            $this->recorder()->record(new Exchange(
                 id: $id,
                 correlationId: Correlation::id(),
                 transport: Exchange::TRANSPORT_PSR18,

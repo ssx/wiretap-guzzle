@@ -248,3 +248,52 @@ describe('interoperability', function (): void {
         expect($sink->all())->toBeEmpty();
     });
 });
+
+describe('lazy recorder resolution', function (): void {
+    it('resolves the recorder per call, so a later swap is honoured', function (): void {
+        // A handler stack is built once, at boot, frequently before the
+        // application has finished deciding what its recorder should be — a
+        // test calling Wiretap::fake() afterwards, for instance. Holding a
+        // fixed instance means those later decisions are silently ignored.
+        $first = new InMemorySink();
+        $second = new InMemorySink();
+
+        // A mutable holder, because an arrow function captures by value and
+        // reassigning a local would never reach the closure.
+        $holder = new class {
+            public Recorder $recorder;
+        };
+        $holder->recorder = new Recorder(sink: $first);
+
+        $stack = HandlerStack::create(new MockHandler([new Response(200), new Response(200)]));
+        Stack::attach($stack, static fn (): Recorder => $holder->recorder);
+        $client = new Client(['handler' => $stack]);
+
+        $client->get('https://api.example.com/first');
+        $holder->recorder->flush();
+
+        // Swap the recorder after the stack was built.
+        $holder->recorder = new Recorder(sink: $second);
+
+        $client->get('https://api.example.com/second');
+        $holder->recorder->flush();
+
+        expect($first->all())->toHaveCount(1)
+            ->and($first->all()[0]->uri)->toContain('/first')
+            ->and($second->all())->toHaveCount(1)
+            ->and($second->all()[0]->uri)->toContain('/second');
+    });
+
+    it('still accepts a recorder instance directly', function (): void {
+        $sink = new InMemorySink();
+        $recorder = new Recorder(sink: $sink);
+
+        $stack = HandlerStack::create(new MockHandler([new Response(200)]));
+        Stack::attach($stack, $recorder);
+
+        (new Client(['handler' => $stack]))->get('https://api.example.com/v1');
+        $recorder->flush();
+
+        expect($sink->all())->toHaveCount(1);
+    });
+});
