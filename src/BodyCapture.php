@@ -83,8 +83,13 @@ final readonly class BodyCapture
 
             // getSize() is null for pipes and unknown-length streams, which is
             // why the truncation test has to be written twice.
+            //
+            // For the unknown case, reaching the read limit is what signals
+            // truncation. Checking eof() alone reported a body read right up
+            // to the limit as complete, and then reported the prefix length as
+            // its full size — two wrong answers about the same body.
             $truncated = $size === null
-                ? !$stream->eof()
+                ? strlen($bytes) >= $this->maxBytes
                 : $size > strlen($bytes);
 
             return CapturedBody::captured(

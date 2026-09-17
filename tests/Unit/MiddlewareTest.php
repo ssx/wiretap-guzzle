@@ -493,3 +493,38 @@ describe('resource fixes found by review', function (): void {
         expect(json_encode($sink->all()))->not->toContain('4111111111111111');
     });
 });
+
+describe('unknown-length bodies', function (): void {
+    it('reports an unknown size rather than the prefix length', function (): void {
+        // Reporting strlen($bytes) claimed the prefix *was* the whole body, so
+        // a HAR export showed a four-byte transfer for a body whose real size
+        // was never known.
+        $inner = \GuzzleHttp\Psr7\Utils::streamFor('0123456789');
+
+        $unknown = new class($inner) implements \Psr\Http\Message\StreamInterface {
+            public function __construct(private \Psr\Http\Message\StreamInterface $i) {}
+
+            public function getSize(): ?int { return null; }
+            public function read($length): string { return $this->i->read($length); }
+            public function eof(): bool { return $this->i->eof(); }
+            public function tell(): int { return $this->i->tell(); }
+            public function isSeekable(): bool { return true; }
+            public function seek($offset, $whence = SEEK_SET): void { $this->i->seek($offset, $whence); }
+            public function rewind(): void { $this->i->rewind(); }
+            public function isReadable(): bool { return true; }
+            public function __toString(): string { return ''; }
+            public function close(): void {}
+            public function detach() { return null; }
+            public function isWritable(): bool { return false; }
+            public function write($string): int { return 0; }
+            public function getContents(): string { return ''; }
+            public function getMetadata($key = null) { return null; }
+        };
+
+        $captured = (new \Ssx\Wiretap\Guzzle\BodyCapture(maxBytes: 4))->capture($unknown, 'text/plain');
+
+        expect($captured->bytes)->toBe('0123')
+            ->and($captured->size)->toBeNull()
+            ->and($captured->truncated)->toBeTrue();
+    });
+});
