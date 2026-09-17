@@ -442,3 +442,54 @@ describe('hardening found by review', function (): void {
             ->and($redacted->bytes)->not->toContain('ordinary-secret-value');
     });
 });
+
+describe('resource fixes found by review', function (): void {
+    it('records under the recorder the request was admitted with', function (): void {
+        // An async request started under A and resolved after the holder moved
+        // to B was writing to B — mixing concurrent scopes and sending the
+        // capture to a policy that never admitted it.
+        $admitted = new InMemorySink();
+        $later = new InMemorySink();
+
+        $holder = new class {
+            public Recorder $recorder;
+        };
+        $holder->recorder = new Recorder(sink: $admitted);
+
+        $stack = HandlerStack::create(new MockHandler([new Response(200)]));
+        Stack::attach($stack, static fn (): Recorder => $holder->recorder);
+
+        $promise = (new Client(['handler' => $stack]))->getAsync('https://api.example.com/v1');
+
+        // Swap the holder before the promise settles.
+        $original = $holder->recorder;
+        $holder->recorder = new Recorder(sink: $later);
+
+        $promise->wait();
+        $original->flush();
+        $holder->recorder->flush();
+
+        expect($admitted->all())->toHaveCount(1)
+            ->and($later->all())->toBeEmpty();
+    });
+
+    it('does not read the body of a host that became blocked after a redirect', function (): void {
+        $sink = new InMemorySink();
+        $recorder = new Recorder(
+            sink: $sink,
+            blocklist: new Blocklist([new ArrayBlocklistProvider(['blocked.example.com'])]),
+        );
+
+        $stack = HandlerStack::create(new MockHandler([
+            new Response(302, ['Location' => 'https://blocked.example.com/secret']),
+            new Response(200, [], '{"card":"4111111111111111"}'),
+        ]));
+        Stack::attach($stack, $recorder);
+
+        (new Client(['handler' => $stack]))->get('https://allowed.example.com/start');
+        $recorder->flush();
+
+        // Nothing stored, and the payload was never pulled into a record.
+        expect(json_encode($sink->all()))->not->toContain('4111111111111111');
+    });
+});

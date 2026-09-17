@@ -46,6 +46,7 @@ final class PendingExchange
     private bool $recorded = false;
 
     public function __construct(
+        private readonly \Ssx\Wiretap\Recorder $recorder,
         private readonly string $id,
         private readonly string $correlationId,
         private readonly int $sequence,
@@ -58,6 +59,20 @@ final class PendingExchange
         $this->responseHeaders = Headers::empty();
         $this->responseBody = CapturedBody::none();
         $this->timings = new Timings();
+    }
+
+    public function recorder(): \Ssx\Wiretap\Recorder
+    {
+        return $this->recorder;
+    }
+
+    /**
+     * The URI as it currently stands — the original request, or the effective
+     * one once stats have been seen.
+     */
+    public function uri(): string
+    {
+        return $this->uri;
     }
 
     public function response(ResponseInterface $response, CapturedBody $body): void
@@ -84,20 +99,44 @@ final class PendingExchange
             ? Timings::fromCurlInfo($handlerStats)
             : Timings::fromElapsedSeconds($stats->getTransferTime() ?? 0.0);
 
-        // A ConnectException carries no response, so the curl errno from the
-        // handler is the only description of what went wrong.
+        // A ConnectException carries no response, so the curl errno is the
+        // only description of what went wrong.
+        //
+        // getHandlerErrorData() is where Guzzle puts it. Reading `errno` out
+        // of the stats array happened to work with some handlers and returned
+        // nothing with others.
         if ($this->error === null && !$stats->hasResponse()) {
-            $errno = $handlerStats['errno'] ?? null;
-
-            if (is_int($errno) && $errno !== 0) {
-                $this->error = new TransferError(
-                    errno: $errno,
-                    message: is_string($handlerStats['error'] ?? null) && $handlerStats['error'] !== ''
-                        ? $handlerStats['error']
-                        : 'Transfer failed',
-                );
-            }
+            $this->error = $this->errorFrom($stats, $handlerStats);
         }
+    }
+
+    /**
+     * @param array<string, mixed> $handlerStats
+     */
+    private function errorFrom(TransferStats $stats, array $handlerStats): ?TransferError
+    {
+        $data = $stats->getHandlerErrorData();
+
+        if (is_int($data) && $data !== 0) {
+            return new TransferError($data, 'curl error ' . $data);
+        }
+
+        if (is_string($data) && $data !== '') {
+            return new TransferError(-1, $data);
+        }
+
+        $errno = $handlerStats['errno'] ?? null;
+
+        if (is_int($errno) && $errno !== 0) {
+            return new TransferError(
+                errno: $errno,
+                message: is_string($handlerStats['error'] ?? null) && $handlerStats['error'] !== ''
+                    ? $handlerStats['error']
+                    : 'Transfer failed',
+            );
+        }
+
+        return null;
     }
 
     /**
