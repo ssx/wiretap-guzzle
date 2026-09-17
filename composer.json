@@ -3,7 +3,13 @@
     "description": "Guzzle capture for wiretap. Records outbound requests and responses from clients you construct yourself.",
     "type": "library",
     "license": "MIT",
-    "keywords": ["http", "guzzle", "debugging", "logging", "middleware"],
+    "keywords": [
+        "http",
+        "guzzle",
+        "debugging",
+        "logging",
+        "middleware"
+    ],
     "authors": [
         {
             "name": "Scott Robinson",
@@ -12,7 +18,7 @@
     ],
     "require": {
         "php": "^8.2",
-        "ssx/wiretap": "^0.1 || dev-main",
+        "ssx/wiretap": "~0.0.1 || dev-main",
         "guzzlehttp/guzzle": "^7.5",
         "psr/http-message": "^1.1 || ^2.0"
     },
