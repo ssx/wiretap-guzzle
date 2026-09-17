@@ -22,8 +22,18 @@ use Ssx\Wiretap\CapturedBody;
  */
 final readonly class BodyCapture
 {
+    /**
+     * @param int $maxBytes A hard memory ceiling, not the redaction limit.
+     *
+     * These are deliberately different numbers. Capturing only 64 KiB here
+     * would hand the redactor a truncated JSON body it cannot parse, so
+     * configured body-path rules would silently do nothing — and the core then
+     * has to drop the body entirely to stay safe. Reading a larger bounded
+     * amount lets structural redaction actually run, and the core truncates to
+     * its own limit afterwards.
+     */
     public function __construct(
-        private int $maxBytes = 65536,
+        private int $maxBytes = 1_048_576,
         private bool $hashFullBody = true,
     ) {
     }
@@ -64,7 +74,7 @@ final readonly class BodyCapture
         try {
             $stream->rewind();
 
-            $bytes = $stream->read($this->maxBytes);
+            $bytes = $this->readUpTo($stream, $this->maxBytes);
             $sha256 = null;
 
             if ($this->hashFullBody) {
@@ -74,12 +84,12 @@ final readonly class BodyCapture
             // getSize() is null for pipes and unknown-length streams, which is
             // why the truncation test has to be written twice.
             $truncated = $size === null
-                ? strlen($bytes) >= $this->maxBytes
-                : $size > $this->maxBytes;
+                ? !$stream->eof()
+                : $size > strlen($bytes);
 
             return CapturedBody::captured(
                 bytes: $bytes,
-                size: $size ?? strlen($bytes),
+                size: $size ?? ($truncated ? null : strlen($bytes)),
                 contentType: $contentType,
                 truncated: $truncated,
                 sha256: $sha256,
@@ -95,6 +105,31 @@ final readonly class BodyCapture
                 // stream alone than to keep poking at it.
             }
         }
+    }
+
+    /**
+     * Read up to $limit bytes, tolerating short reads.
+     *
+     * StreamInterface::read() may return fewer bytes than asked for before
+     * EOF. Treating the first short read as the whole body stored a three-byte
+     * prefix of a ten-byte payload and marked it complete.
+     */
+    private function readUpTo(StreamInterface $stream, int $limit): string
+    {
+        $buffer = '';
+
+        while (strlen($buffer) < $limit && !$stream->eof()) {
+            $chunk = $stream->read($limit - strlen($buffer));
+
+            if ($chunk === '') {
+                // No progress. Stop rather than spin.
+                break;
+            }
+
+            $buffer .= $chunk;
+        }
+
+        return $buffer;
     }
 
     /**

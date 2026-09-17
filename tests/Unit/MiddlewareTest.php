@@ -11,6 +11,7 @@ use GuzzleHttp\Psr7\Response;
 use GuzzleHttp\TransferStats;
 use Ssx\Wiretap\Blocklist\ArrayBlocklistProvider;
 use Ssx\Wiretap\Blocklist\Blocklist;
+use Ssx\Wiretap\Contract\ExchangeSink;
 use Ssx\Wiretap\Exchange;
 use Ssx\Wiretap\Guzzle\Stack;
 use Ssx\Wiretap\Recorder;
@@ -295,5 +296,149 @@ describe('lazy recorder resolution', function (): void {
         $recorder->flush();
 
         expect($sink->all())->toHaveCount(1);
+    });
+});
+
+describe('hardening found by review', function (): void {
+    it('records the final response of a redirect, not the hop', function (): void {
+        // on_stats fires once per transfer, so committing there recorded the
+        // 302 Guzzle was about to follow and discarded the 200 the application
+        // actually received.
+        $sink = new InMemorySink();
+        $recorder = new Recorder(sink: $sink);
+
+        $stack = HandlerStack::create(new MockHandler([
+            new Response(302, ['Location' => 'https://api.example.com/final']),
+            new Response(200, [], 'final body'),
+        ]));
+        Stack::attach($stack, $recorder);
+
+        $response = (new Client(['handler' => $stack]))->get('https://api.example.com/start');
+        $recorder->flush();
+
+        expect($response->getStatusCode())->toBe(200)
+            ->and($sink->all())->toHaveCount(1)
+            ->and($sink->all()[0]->status)->toBe(200)
+            ->and($sink->all()[0]->responseBody->bytes)->toBe('final body');
+    });
+
+    it('sends the request anyway when capture setup throws', function (): void {
+        // tell() is called by capture and not by Guzzle, so an Error here
+        // isolates instrumentation failure from transport failure. Guzzle
+        // itself calls getSize(), so a stream that throws there would fail the
+        // request with or without wiretap.
+        $exploding = new class implements \Psr\Http\Message\StreamInterface {
+            public function tell(): int
+            {
+                throw new Error('cannot tell position');
+            }
+
+            public function getSize(): ?int { return 9; }
+            public function __toString(): string { return 'payload9'; }
+            public function close(): void {}
+            public function detach() { return null; }
+            public function eof(): bool { return true; }
+            public function isSeekable(): bool { return true; }
+            public function seek($offset, $whence = SEEK_SET): void {}
+            public function rewind(): void {}
+            public function isWritable(): bool { return false; }
+            public function write($string): int { return 0; }
+            public function isReadable(): bool { return true; }
+            public function read($length): string { return 'payload9'; }
+            public function getContents(): string { return 'payload9'; }
+            public function getMetadata($key = null) { return null; }
+        };
+
+        $sink = new InMemorySink();
+        $recorder = new Recorder(sink: $sink);
+
+        $stack = HandlerStack::create(new MockHandler([new Response(200, [], 'delivered')]));
+        Stack::attach($stack, $recorder);
+
+        $request = new Request('POST', 'https://api.example.com/v1', [], $exploding);
+        $response = (new Client(['handler' => $stack]))->send($request);
+
+        expect((string) $response->getBody())->toBe('delivered');
+    });
+
+    it('does not turn a successful response into a rejection when capture fails', function (): void {
+        $sink = new class implements ExchangeSink {
+            public function write(Exchange $exchange): void
+            {
+                throw new RuntimeException('sink exploded');
+            }
+
+            public function writeBatch(iterable $exchanges): void
+            {
+                throw new RuntimeException('sink exploded');
+            }
+        };
+
+        $recorder = new Recorder(sink: $sink);
+        $stack = HandlerStack::create(new MockHandler([new Response(200, [], 'ok')]));
+        Stack::attach($stack, $recorder);
+
+        $response = (new Client(['handler' => $stack]))->get('https://api.example.com/v1');
+
+        expect($response->getStatusCode())->toBe(200);
+    });
+
+    it('captures a body across short reads', function (): void {
+        // StreamInterface::read() may return fewer bytes than asked for. The
+        // first short read was treated as the whole body.
+        $stream = new class implements \Psr\Http\Message\StreamInterface {
+            private string $data = '0123456789';
+            private int $pos = 0;
+
+            public function read($length): string
+            {
+                // Three bytes at a time, however many are requested.
+                $chunk = substr($this->data, $this->pos, min(3, $length));
+                $this->pos += strlen($chunk);
+
+                return $chunk;
+            }
+
+            public function getSize(): ?int { return strlen($this->data); }
+            public function eof(): bool { return $this->pos >= strlen($this->data); }
+            public function tell(): int { return $this->pos; }
+            public function isSeekable(): bool { return true; }
+            public function seek($offset, $whence = SEEK_SET): void { $this->pos = (int) $offset; }
+            public function rewind(): void { $this->pos = 0; }
+            public function isReadable(): bool { return true; }
+            public function __toString(): string { return $this->data; }
+            public function close(): void {}
+            public function detach() { return null; }
+            public function isWritable(): bool { return false; }
+            public function write($string): int { return 0; }
+            public function getContents(): string { return $this->data; }
+            public function getMetadata($key = null) { return null; }
+        };
+
+        $captured = (new \Ssx\Wiretap\Guzzle\BodyCapture())->capture($stream, 'text/plain');
+
+        expect($captured->bytes)->toBe('0123456789')
+            ->and($captured->truncated)->toBeFalse();
+    });
+
+    it('captures enough for structural redaction to run on a large body', function (): void {
+        // Capturing only 64 KiB handed the redactor unparseable JSON, so
+        // configured body-path rules silently did nothing.
+        $payload = json_encode([
+            'password' => 'ordinary-secret-value',
+            'padding' => str_repeat('x', 100_000),
+        ]);
+
+        $captured = (new \Ssx\Wiretap\Guzzle\BodyCapture())->capture(
+            \GuzzleHttp\Psr7\Utils::streamFor($payload),
+            'application/json',
+        );
+
+        $redacted = (new \Ssx\Wiretap\Redaction\Redactor(
+            new \Ssx\Wiretap\Redaction\RedactionConfig(bodyPaths: ['password'])
+        ))->redactBody($captured);
+
+        expect($redacted->isPresent())->toBeTrue()
+            ->and($redacted->bytes)->not->toContain('ordinary-secret-value');
     });
 });
