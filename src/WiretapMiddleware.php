@@ -108,15 +108,19 @@ final class WiretapMiddleware
     {
         $url = (string) $request->getUri();
 
+        // Resolved once, here, and carried on the pending exchange.
+        $recorder = $this->recorder();
+
         // The gate runs before anything is read. A blocked payload should
         // never exist in process memory, not merely never be stored.
-        if (!$this->recorder()->shouldCapture($url)) {
+        if (!$recorder->shouldCapture($url)) {
             return null;
         }
 
         $streaming = (bool) ($options['stream'] ?? false);
 
         $pending = new PendingExchange(
+            recorder: $recorder,
             id: Ulid::generate(),
             correlationId: Correlation::id(),
             sequence: Correlation::nextSequence(),
@@ -145,7 +149,7 @@ final class WiretapMiddleware
                 // turn a successful response into a rejected promise.
                 try {
                     if (!$pending->isRecorded()) {
-                        $pending->response($response, $this->captureResponseBody($response, $pending->streaming));
+                        $pending->response($response, $this->captureResponseBody($pending, $response));
                         $this->commit($pending);
                     }
                 } catch (\Throwable) {
@@ -158,7 +162,7 @@ final class WiretapMiddleware
                     if (!$pending->isRecorded()) {
                         if ($reason instanceof RequestException && $reason->getResponse() !== null) {
                             $response = $reason->getResponse();
-                            $pending->response($response, $this->captureResponseBody($response, $pending->streaming));
+                            $pending->response($response, $this->captureResponseBody($pending, $response));
                         }
 
                         if ($reason instanceof \Throwable) {
@@ -219,16 +223,32 @@ final class WiretapMiddleware
     private function commit(PendingExchange $pending): void
     {
         if ($pending->markRecorded()) {
-            $this->recorder()->record($pending->toExchange());
+            // The recorder this request was admitted under, not whatever is
+            // current now. An async request started under recorder A and
+            // resolved after the holder moved to B was writing its record to
+            // B — mixing concurrent scopes, and sending a capture to a sink
+            // and redaction policy that never admitted it.
+            $pending->recorder()->record($pending->toExchange());
         }
     }
 
-    private function captureResponseBody(ResponseInterface $response, bool $streaming): CapturedBody
+    private function captureResponseBody(PendingExchange $pending, ResponseInterface $response): CapturedBody
     {
+        // Re-gate on the effective URI before reading anything.
+        //
+        // Wiretap sits above Guzzle's redirect middleware, so a redirected hop
+        // never re-enters the gate. An allowed URL redirecting to a blocked
+        // host had the blocked body read into memory, and only then did the
+        // recorder reject the record. Nothing was stored, but the payload
+        // existed — which is precisely what the gate exists to prevent.
+        if (!$pending->recorder()->shouldCapture($pending->uri())) {
+            return CapturedBody::omitted(CapturedBody::OMITTED_DISABLED);
+        }
+
         return $this->bodyCapture->capture(
             $response->getBody(),
             $response->getHeaderLine('Content-Type') ?: null,
-            $streaming,
+            $pending->streaming,
         );
     }
 }
