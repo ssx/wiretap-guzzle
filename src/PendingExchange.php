@@ -77,6 +77,11 @@ final class PendingExchange
 
     public function response(ResponseInterface $response, CapturedBody $body): void
     {
+        // A response means this attempt reached the server. Any errno from an
+        // earlier attempt belongs to that attempt — leaving it made every
+        // request retried after a connection failure read as failed, which is
+        // exactly backwards for always-keep-failures sampling.
+        $this->error = null;
         $this->status = $response->getStatusCode();
         $this->reason = $response->getReasonPhrase() ?: null;
         $this->responseHeaders = Headers::fromMap($response->getHeaders());

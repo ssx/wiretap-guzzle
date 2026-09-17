@@ -32,9 +32,19 @@ final readonly class BodyCapture
      * amount lets structural redaction actually run, and the core truncates to
      * its own limit afterwards.
      */
+    /**
+     * @param int $maxHashBytes Largest body that will be hashed in full.
+     *
+     * Hashing used to read to EOF regardless of $maxBytes, which bounded
+     * memory but not I/O: a 512 MiB upload was read end to end before the
+     * request was even dispatched, adding seconds of wall time to a call the
+     * application was waiting on. Anything larger than this now reports no
+     * digest rather than paying for one.
+     */
     public function __construct(
         private int $maxBytes = 1_048_576,
         private bool $hashFullBody = true,
+        private int $maxHashBytes = 8_388_608,
     ) {
     }
 
@@ -77,7 +87,9 @@ final readonly class BodyCapture
             $bytes = $this->readUpTo($stream, $this->maxBytes);
             $sha256 = null;
 
-            if ($this->hashFullBody) {
+            // Only when the size is known and small enough to be worth the
+            // second read. An unknown size could be endless.
+            if ($this->hashFullBody && $size !== null && $size <= $this->maxHashBytes) {
                 $sha256 = $this->hashRemaining($stream, $bytes);
             }
 
