@@ -43,6 +43,13 @@ final class PendingExchange
 
     private ?TransferError $error = null;
 
+    /**
+     * Every URI this exchange has been seen at, original first.
+     *
+     * @var list<string>
+     */
+    private array $hops = [];
+
     private bool $recorded = false;
 
     public function __construct(
@@ -59,7 +66,20 @@ final class PendingExchange
         $this->responseHeaders = Headers::empty();
         $this->responseBody = CapturedBody::none();
         $this->timings = new Timings();
+        $this->hops[] = $uri;
+        $this->originalUri = $uri;
     }
+
+    /**
+     * The URI the application actually asked for.
+     *
+     * This is what the recorded method, headers and body belong to, and it is
+     * what the redactor has to see: overwriting it with the effective URI
+     * after a redirect threw away the credentials in the original query
+     * string before the redactor could learn them, so a response echoing one
+     * back reached the sink in plaintext.
+     */
+    private readonly string $originalUri;
 
     public function recorder(): \Ssx\Wiretap\Recorder
     {
@@ -95,8 +115,15 @@ final class PendingExchange
 
     public function stats(TransferStats $stats): void
     {
-        // The effective URI is what a redirect chain actually reached.
+        // The effective URI is what a redirect chain actually reached. It is
+        // tracked as a hop rather than overwriting the original, so the
+        // blocklist can be checked against where the request ended up while
+        // the record still describes what the application sent.
         $this->uri = (string) $stats->getEffectiveUri();
+
+        if (!in_array($this->uri, $this->hops, true)) {
+            $this->hops[] = $this->uri;
+        }
 
         $handlerStats = $stats->getHandlerStats();
 
@@ -110,6 +137,15 @@ final class PendingExchange
         // getHandlerErrorData() is where Guzzle puts it. Reading `errno` out
         // of the stats array happened to work with some handlers and returned
         // nothing with others.
+        // A ConnectException carries no response, so the curl errno is the
+        // only description of what went wrong.
+        //
+        // getHandlerErrorData() is where Guzzle puts it. Reading `errno` out
+        // of the stats array happened to work with some handlers and returned
+        // nothing with others.
+        //
+        // An error from an earlier attempt is cleared by response(), so a
+        // retry that succeeds does not report the failed attempt's errno.
         if ($this->error === null && !$stats->hasResponse()) {
             $this->error = $this->errorFrom($stats, $handlerStats);
         }
@@ -164,6 +200,23 @@ final class PendingExchange
         return $this->recorded;
     }
 
+    /**
+     * Where the request ended up, when that is not where it started.
+     *
+     * The effective URI is worth keeping — it is the whole point of following
+     * a redirect — but it does not belong in `uri`, which has to agree with
+     * the recorded method, headers and body. Context is redacted like
+     * everything else, so credentials in a redirect target are not exempt.
+     *
+     * @return array<array-key, mixed>
+     */
+    private function context(): array
+    {
+        $redirects = array_values(array_slice($this->hops, 1));
+
+        return $redirects === [] ? [] : ['redirected_to' => $redirects];
+    }
+
     public function toExchange(): Exchange
     {
         return new Exchange(
@@ -171,7 +224,7 @@ final class PendingExchange
             correlationId: $this->correlationId,
             transport: Exchange::TRANSPORT_GUZZLE,
             method: $this->method,
-            uri: $this->uri,
+            uri: $this->originalUri,
             requestHeaders: $this->requestHeaders,
             requestBody: $this->requestBody,
             status: $this->status,
@@ -181,6 +234,7 @@ final class PendingExchange
             timings: $this->timings,
             error: $this->error,
             startedAt: $this->startedAt,
+            context: $this->context(),
             sequence: $this->sequence,
             pid: getmypid() ?: null,
         );

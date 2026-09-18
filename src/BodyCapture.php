@@ -33,18 +33,35 @@ final readonly class BodyCapture
      * its own limit afterwards.
      */
     /**
-     * @param int $maxHashBytes Largest body that will be hashed in full.
+     * @param bool $hashFullBody Off by default, and not a performance setting.
      *
-     * Hashing used to read to EOF regardless of $maxBytes, which bounded
-     * memory but not I/O: a 512 MiB upload was read end to end before the
-     * request was even dispatched, adding seconds of wall time to a call the
-     * application was waiting on. Anything larger than this now reports no
-     * digest rather than paying for one.
+     * The digest is taken over the body as sent, before redaction has run.
+     * Core drops it whenever redaction rewrote the body, precisely because an
+     * unkeyed SHA-256 of the plaintext sitting beside `[REDACTED]` is an
+     * offline oracle — a four-digit PIN falls to ten thousand guesses. But a
+     * truncated capture is the case core cannot see: the stored prefix may be
+     * unchanged while the digest still covers a tail that was never redacted
+     * and never stored.
+     *
+     * So this is opt-in. Core's own hash hints work the same way and refuse to
+     * emit anything without a per-install `hashSalt`; turn this on only where
+     * comparing payloads across exchanges is worth that, and set a salt.
+     *
+     * @param int $maxHashBytes A read budget, not a size threshold.
+     *
+     * Hashing used to read to EOF, which bounded memory but not I/O: a 512 MiB
+     * upload was read end to end before the request was even dispatched. The
+     * size check that replaced it trusted getSize(), which a caching wrapper
+     * makes meaningless — a four-byte capture over Guzzle's CachingStream read
+     * and retained 3 MiB. This is now enforced against bytes actually read, so
+     * a stream that lies about its length, or does not know it, cannot exceed
+     * it. A body that does not finish within the budget reports no digest
+     * rather than an incomplete one.
      */
     public function __construct(
         private int $maxBytes = 1_048_576,
-        private bool $hashFullBody = true,
-        private int $maxHashBytes = 8_388_608,
+        private bool $hashFullBody = false,
+        private int $maxHashBytes = 1_048_576,
     ) {
     }
 
@@ -85,24 +102,28 @@ final readonly class BodyCapture
             $stream->rewind();
 
             $bytes = $this->readUpTo($stream, $this->maxBytes);
+
+            // One byte past the limit, to settle the unknown-length case.
+            //
+            // getSize() is null for pipes and unknown-length streams, so the
+            // truncation test has to be written twice. Treating "filled the
+            // buffer" as truncated marked a body that was exactly the limit
+            // as a prefix, and then reported its size as unknown — two wrong
+            // answers about a body we had in full. eof() cannot settle it
+            // either: a stream at its last byte does not report eof until
+            // something reads past it. Asking for one more byte does, and the
+            // byte is not thrown away — it is hashed, just not stored.
+            $overflow = $size === null ? $this->readUpTo($stream, 1) : '';
+
+            $truncated = $size === null
+                ? $overflow !== ''
+                : $size > strlen($bytes);
+
             $sha256 = null;
 
-            // Only when the size is known and small enough to be worth the
-            // second read. An unknown size could be endless.
-            if ($this->hashFullBody && $size !== null && $size <= $this->maxHashBytes) {
-                $sha256 = $this->hashRemaining($stream, $bytes);
+            if ($this->hashFullBody) {
+                $sha256 = $this->hashRemaining($stream, $bytes . $overflow);
             }
-
-            // getSize() is null for pipes and unknown-length streams, which is
-            // why the truncation test has to be written twice.
-            //
-            // For the unknown case, reaching the read limit is what signals
-            // truncation. Checking eof() alone reported a body read right up
-            // to the limit as complete, and then reported the prefix length as
-            // its full size — two wrong answers about the same body.
-            $truncated = $size === null
-                ? strlen($bytes) >= $this->maxBytes
-                : $size > strlen($bytes);
 
             return CapturedBody::captured(
                 bytes: $bytes,
@@ -155,20 +176,37 @@ final readonly class BodyCapture
      * This is what makes truncation tolerable: two exchanges can still be
      * compared for an identical payload, and a reader can tell whether what
      * they are looking at is all of it.
+     *
+     * Bounded by bytes actually read, including the prefix the caller already
+     * has. Returns null rather than a partial digest if the body does not end
+     * within the budget — a digest that silently covered only part of a body
+     * would compare unequal payloads as equal.
      */
     private function hashRemaining(StreamInterface $stream, string $alreadyRead): ?string
     {
+        if (strlen($alreadyRead) > $this->maxHashBytes) {
+            return null;
+        }
+
         try {
             $context = hash_init('sha256');
             hash_update($context, $alreadyRead);
 
+            $read = strlen($alreadyRead);
+
             while (!$stream->eof()) {
-                $chunk = $stream->read(8192);
+                if ($read >= $this->maxHashBytes) {
+                    // Budget spent before the body ended.
+                    return null;
+                }
+
+                $chunk = $stream->read(min(8192, $this->maxHashBytes - $read));
 
                 if ($chunk === '') {
                     break;
                 }
 
+                $read += strlen($chunk);
                 hash_update($context, $chunk);
             }
 
