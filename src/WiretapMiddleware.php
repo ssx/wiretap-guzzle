@@ -207,6 +207,20 @@ final class WiretapMiddleware
                 // whose results are discarded — is no longer recorded. That is
                 // a smaller problem than confidently recording a redirect hop
                 // as the response.
+                // The request as sent, before the stats are folded in.
+                //
+                // Anything pushed below this middleware can rewrite the
+                // request after we observed it, and through Laravel's HTTP
+                // client that is the normal case rather than an edge one. See
+                // PendingExchange::requestAsSent().
+                $sent = $stats->getRequest();
+
+                $pending->requestAsSent($sent, $this->bodyCapture->capture(
+                    $sent->getBody(),
+                    $sent->getHeaderLine('Content-Type') ?: null,
+                    $pending->streaming,
+                ));
+
                 $pending->stats($stats);
             } catch (\Throwable) {
                 // Instrumentation must never change application behaviour.
