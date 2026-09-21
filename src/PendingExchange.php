@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ssx\Wiretap\Guzzle;
 
 use GuzzleHttp\TransferStats;
+use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 use Ssx\Wiretap\CapturedBody;
 use Ssx\Wiretap\Exchange;
@@ -57,10 +58,10 @@ final class PendingExchange
         private readonly string $id,
         private readonly string $correlationId,
         private readonly int $sequence,
-        private readonly string $method,
+        private string $method,
         private string $uri,
-        private readonly Headers $requestHeaders,
-        private readonly CapturedBody $requestBody,
+        private Headers $requestHeaders,
+        private CapturedBody $requestBody,
         private readonly float $startedAt,
     ) {
         $this->responseHeaders = Headers::empty();
@@ -113,6 +114,42 @@ final class PendingExchange
         $this->error = $error;
     }
 
+    /**
+     * Replace the recorded request with the one actually sent.
+     *
+     * The middleware sits at the top of the handler stack so it never
+     * decorates a body upstream of a signing middleware — but that also means
+     * it observes the request as the application *built* it, and anything
+     * pushed below it can rewrite the request before it goes out. Through
+     * Laravel's HTTP client, where withRequestMiddleware() and beforeSending()
+     * both run beneath a global middleware, that was routine:
+     *
+     *     server actually saw : PUT  {"actual":true}   X-Api-Key: <credential>
+     *     wiretap recorded    : POST {"original":true}
+     *
+     * Two things wrong at once. The record described a request that never
+     * happened, and the credential header was never recorded — so the redactor
+     * never learned that value, and a response echoing it back was stored in
+     * plaintext.
+     *
+     * TransferStats::getRequest() is the request as sent, and on_stats fires
+     * for it even under Http::fake(). The original is not simply discarded:
+     * its URI is kept as the recorded one, because credentials in the query
+     * string the application built still have to be learned.
+     */
+    public function requestAsSent(RequestInterface $request, CapturedBody $body): void
+    {
+        $this->method = $request->getMethod();
+        $this->requestHeaders = Headers::fromMap($request->getHeaders());
+        $this->requestBody = $body;
+
+        $sent = (string) $request->getUri();
+
+        if (!in_array($sent, $this->hops, true)) {
+            $this->hops[] = $sent;
+        }
+    }
+
     public function stats(TransferStats $stats): void
     {
         // The effective URI is what a redirect chain actually reached. It is
@@ -131,12 +168,6 @@ final class PendingExchange
             ? Timings::fromCurlInfo($handlerStats)
             : Timings::fromElapsedSeconds($stats->getTransferTime() ?? 0.0);
 
-        // A ConnectException carries no response, so the curl errno is the
-        // only description of what went wrong.
-        //
-        // getHandlerErrorData() is where Guzzle puts it. Reading `errno` out
-        // of the stats array happened to work with some handlers and returned
-        // nothing with others.
         // A ConnectException carries no response, so the curl errno is the
         // only description of what went wrong.
         //

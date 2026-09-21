@@ -217,3 +217,75 @@ describe('retries', function (): void {
         expect($sink->all()[0]->error)->not->toBeNull();
     });
 });
+
+describe('the request as sent', function (): void {
+    it('records what a later middleware actually sent, not what was built', function (): void {
+        // This middleware sits at the top of the stack so it never decorates a
+        // body upstream of a signing middleware — which also means anything
+        // pushed below it can rewrite the request after we observed it. The
+        // record then described a request that never happened.
+        $recorder = new Recorder(sink: $sink = new InMemorySink());
+
+        $stack = HandlerStack::create(new MockHandler([
+            new Response(200, ['Content-Type' => 'application/json'], '{}'),
+        ]));
+        $stack->unshift(new WiretapMiddleware(static fn (): Recorder => $recorder));
+
+        // Pushed after, so it runs closer to the transport and rewrites the
+        // request the middleware already looked at.
+        $stack->push(GuzzleHttp\Middleware::mapRequest(
+            static fn (Psr\Http\Message\RequestInterface $r): Psr\Http\Message\RequestInterface => $r
+                ->withMethod('PUT')
+                ->withHeader('X-Rewritten', 'yes'),
+        ));
+
+        (new Client(['handler' => $stack]))->post('https://api.example.com/thing', ['json' => ['a' => 1]]);
+
+        $recorder->flush();
+        $exchange = $sink->all()[0];
+
+        expect($exchange->method)->toBe('PUT')
+            ->and($exchange->requestHeaders->first('X-Rewritten'))->toBe('yes');
+    });
+
+    it('learns a credential a later middleware added, so an echo of it is redacted', function (): void {
+        // The worst half of the same defect: the header carrying the
+        // credential was never recorded, so the redactor never learned that
+        // value and a response echoing it back was stored in plaintext.
+        $recorder = new Recorder(sink: $sink = new InMemorySink());
+
+        $stack = HandlerStack::create(new MockHandler([
+            new Response(200, ['Content-Type' => 'application/json'], '{"echo":"ordinarysecretvalue"}'),
+        ]));
+        $stack->unshift(new WiretapMiddleware(static fn (): Recorder => $recorder));
+        $stack->push(GuzzleHttp\Middleware::mapRequest(
+            static fn (Psr\Http\Message\RequestInterface $r): Psr\Http\Message\RequestInterface
+                => $r->withHeader('Authorization', 'Bearer ordinarysecretvalue'),
+        ));
+
+        (new Client(['handler' => $stack]))->get('https://api.example.com/thing');
+
+        $recorder->flush();
+        $exchange = $sink->all()[0];
+
+        expect($exchange->responseBody->bytes)->not->toContain('ordinarysecretvalue')
+            ->and($exchange->requestHeaders->first('Authorization'))->not->toContain('ordinarysecretvalue');
+    });
+
+    it('keeps the URI the application asked for', function (): void {
+        // The original URI stays the recorded one: credentials in the query
+        // string the application built still have to be learned, and the
+        // recorded method, headers and body belong to it.
+        $recorder = new Recorder(sink: $sink = new InMemorySink());
+
+        $stack = HandlerStack::create(new MockHandler([new Response(200, [], '{}')]));
+        $stack->unshift(new WiretapMiddleware(static fn (): Recorder => $recorder));
+
+        (new Client(['handler' => $stack]))->get('https://api.example.com/start?api_key=ordinarysecretvalue');
+
+        $recorder->flush();
+
+        expect($sink->all()[0]->uri)->toStartWith('https://api.example.com/start')
+            ->and($sink->all()[0]->uri)->not->toContain('ordinarysecretvalue');
+    });
+});
