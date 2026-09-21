@@ -52,59 +52,82 @@ final readonly class WiretapClient implements ClientInterface
     {
         $url = (string) $request->getUri();
 
-        if (!$this->recorder()->shouldCapture($url)) {
-            return $this->inner->sendRequest($request);
+        // The whole setup phase is guarded, and the inner call is not.
+        //
+        // Resolving the recorder, asking the blocklist, generating an id and
+        // reading the request body all used to run unguarded, so a resolver
+        // that threw took the application's request down with it — reproduced
+        // with zero calls to the inner client. Instrumentation that can stop a
+        // request is worse than no instrumentation. On any failure here the
+        // call is delegated uninstrumented instead.
+        //
+        // The inner call stays outside the guard for the opposite reason: if
+        // it were inside, a failure in our own bookkeeping could be caught and
+        // retried, and the application's request would be sent twice.
+        $pending = null;
+
+        try {
+            $recorder = $this->recorder();
+
+            if ($recorder->shouldCapture($url)) {
+                $pending = new PendingPsrExchange(
+                    // Resolved once, at admission, and kept.
+                    //
+                    // Resolving again at completion meant a request admitted
+                    // under one recorder was written through another's sink
+                    // and redaction policy if the holder changed during the
+                    // inner call or a Fiber suspension. Reproduced: the
+                    // admitting recorder received zero records and the other
+                    // received one.
+                    recorder: $recorder,
+                    id: Ulid::generate(),
+                    // Snapshotted for the same reason.
+                    correlationId: Correlation::id(),
+                    sequence: Correlation::nextSequence(),
+                    startedAt: microtime(true),
+                    requestBody: $this->bodyCapture->capture(
+                        $request->getBody(),
+                        $request->getHeaderLine('Content-Type') ?: null,
+                    ),
+                );
+            }
+        } catch (\Throwable) {
+            $pending = null;
         }
 
-        $startedAt = microtime(true);
-        $id = Ulid::generate();
-        $sequence = Correlation::nextSequence();
-
-        $requestBody = $this->bodyCapture->capture(
-            $request->getBody(),
-            $request->getHeaderLine('Content-Type') ?: null,
-        );
+        if ($pending === null) {
+            return $this->inner->sendRequest($request);
+        }
 
         try {
             $response = $this->inner->sendRequest($request);
         } catch (ClientExceptionInterface $e) {
-            $this->record(
-                $id, $sequence, $request, $url, $requestBody, $startedAt,
-                response: null,
-                error: TransferError::fromThrowable($e),
-            );
+            $this->record($pending, $request, $url, response: null, error: TransferError::fromThrowable($e));
 
             throw $e;
         }
 
-        $this->record(
-            $id, $sequence, $request, $url, $requestBody, $startedAt,
-            response: $response,
-            error: null,
-        );
+        $this->record($pending, $request, $url, response: $response, error: null);
 
         return $response;
     }
 
     private function record(
-        string $id,
-        int $sequence,
+        PendingPsrExchange $pending,
         RequestInterface $request,
         string $url,
-        CapturedBody $requestBody,
-        float $startedAt,
         ?ResponseInterface $response,
         ?TransferError $error,
     ): void {
         try {
-            $this->recorder()->record(new Exchange(
-                id: $id,
-                correlationId: Correlation::id(),
+            $pending->recorder->record(new Exchange(
+                id: $pending->id,
+                correlationId: $pending->correlationId,
                 transport: Exchange::TRANSPORT_PSR18,
                 method: $request->getMethod(),
                 uri: $url,
                 requestHeaders: Headers::fromMap($request->getHeaders()),
-                requestBody: $requestBody,
+                requestBody: $pending->requestBody,
                 status: $response?->getStatusCode(),
                 reason: $response?->getReasonPhrase() ?: null,
                 responseHeaders: $response !== null ? Headers::fromMap($response->getHeaders()) : Headers::empty(),
@@ -114,10 +137,10 @@ final readonly class WiretapClient implements ClientInterface
                         $response->getHeaderLine('Content-Type') ?: null,
                     )
                     : CapturedBody::none(),
-                timings: Timings::fromElapsedSeconds(microtime(true) - $startedAt),
+                timings: Timings::fromElapsedSeconds(microtime(true) - $pending->startedAt),
                 error: $error,
-                startedAt: $startedAt,
-                sequence: $sequence,
+                startedAt: $pending->startedAt,
+                sequence: $pending->sequence,
                 pid: getmypid() ?: null,
             ));
         } catch (\Throwable) {
