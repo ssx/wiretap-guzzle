@@ -148,7 +148,7 @@ final class WiretapMiddleware
                 // Every line here is wrapped: a capture failure must not
                 // turn a successful response into a rejected promise.
                 try {
-                    if (!$pending->isRecorded()) {
+                    if (!$pending->isRecorded() && !$pending->isBlocked()) {
                         $pending->response($response, $this->captureResponseBody($pending, $response));
                         $this->commit($pending);
                     }
@@ -159,7 +159,7 @@ final class WiretapMiddleware
             },
             function (mixed $reason) use ($pending): PromiseInterface {
                 try {
-                    if (!$pending->isRecorded()) {
+                    if (!$pending->isRecorded() && !$pending->isBlocked()) {
                         if ($reason instanceof RequestException && $reason->getResponse() !== null) {
                             $response = $reason->getResponse();
                             $pending->response($response, $this->captureResponseBody($pending, $response));
@@ -215,13 +215,31 @@ final class WiretapMiddleware
                 // PendingExchange::requestAsSent().
                 $sent = $stats->getRequest();
 
-                $pending->requestAsSent($sent, $this->bodyCapture->capture(
-                    $sent->getBody(),
-                    $sent->getHeaderLine('Content-Type') ?: null,
-                    $pending->streaming,
-                ));
+                // Every hop is gated, not just the first. Only the original
+                // URI used to be checked: a redirect or a lower middleware
+                // moving the request onto a blocked host had that hop's body
+                // read and its status and headers stored, and core's own
+                // re-check passed because the record carried the allowed
+                // original URI. Once any hop is blocked nothing more is read
+                // and the exchange is never recorded: keeping the admitted
+                // first hop alone would store a request whose response came
+                // from somewhere the operator said never to capture.
+                $recorder = $pending->recorder();
 
-                $pending->stats($stats);
+                if (!$recorder->shouldCapture((string) $sent->getUri())
+                    || !$recorder->shouldCapture((string) $stats->getEffectiveUri())) {
+                    $pending->block();
+                }
+
+                if (!$pending->isBlocked()) {
+                    $pending->requestAsSent($sent, $this->bodyCapture->capture(
+                        $sent->getBody(),
+                        $sent->getHeaderLine('Content-Type') ?: null,
+                        $pending->streaming,
+                    ));
+
+                    $pending->stats($stats);
+                }
             } catch (\Throwable) {
                 // Instrumentation must never change application behaviour.
             }
@@ -263,7 +281,8 @@ final class WiretapMiddleware
 
     private function commit(PendingExchange $pending): void
     {
-        if ($pending->markRecorded()) {
+        // A blocked hop anywhere in the chain means no record at all.
+        if ($pending->markRecorded() && !$pending->isBlocked()) {
             // The recorder this request was admitted under, not whatever is
             // current now. An async request started under recorder A and
             // resolved after the holder moved to B was writing its record to
@@ -282,7 +301,7 @@ final class WiretapMiddleware
         // host had the blocked body read into memory, and only then did the
         // recorder reject the record. Nothing was stored, but the payload
         // existed — which is precisely what the gate exists to prevent.
-        if (!$pending->recorder()->shouldCapture($pending->uri())) {
+        if ($pending->isBlocked() || !$pending->recorder()->shouldCapture($pending->uri())) {
             return CapturedBody::omitted(CapturedBody::OMITTED_DISABLED);
         }
 

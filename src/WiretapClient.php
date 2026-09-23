@@ -121,6 +121,10 @@ final readonly class WiretapClient implements ClientInterface
         ?TransferError $error,
     ): void {
         try {
+            if ($response !== null && $this->endedOnBlockedUri($pending->recorder, $response)) {
+                return;
+            }
+
             $pending->recorder->record(new Exchange(
                 id: $pending->id,
                 correlationId: $pending->correlationId,
@@ -144,6 +148,46 @@ final readonly class WiretapClient implements ClientInterface
         } catch (\Throwable) {
             // Never change application behaviour.
         }
+    }
+
+    /**
+     * Whether the inner client followed a redirect onto a blocked URI.
+     *
+     * Only the request URI was gated. A client that follows redirects itself —
+     * Symfony's Psr18Client does by default — could land on a blocked host,
+     * and that host's status, headers and body were stored under the allowed
+     * original URI, which core's own re-check then accepted.
+     *
+     * PSR-18 has no standard way to say where a response came from, so this
+     * checks what the common clients expose without reading the body:
+     * Guzzle's redirect history header, and the effective URL Symfony keeps
+     * on the response behind its body stream. A hop onto a blocked URI means
+     * no record at all. A client exposing neither cannot be checked, and only
+     * its request URI is gated.
+     */
+    private function endedOnBlockedUri(Recorder $recorder, ResponseInterface $response): bool
+    {
+        foreach ($response->getHeader('X-Guzzle-Redirect-History') as $hop) {
+            if (!$recorder->shouldCapture($hop)) {
+                return true;
+            }
+        }
+
+        $wrapper = $response->getBody()->getMetadata('wrapper_data');
+
+        if (is_object($wrapper) && method_exists($wrapper, 'getResponse')) {
+            $inner = $wrapper->getResponse();
+
+            if (is_object($inner) && method_exists($inner, 'getInfo')) {
+                $url = $inner->getInfo('url');
+
+                if (is_string($url) && $url !== '' && !$recorder->shouldCapture($url)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**
