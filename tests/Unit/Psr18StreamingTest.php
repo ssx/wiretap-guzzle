@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+use GuzzleHttp\Psr7\CachingStream;
+use GuzzleHttp\Psr7\PumpStream;
 use GuzzleHttp\Psr7\Request;
 use GuzzleHttp\Psr7\Response;
 use GuzzleHttp\Psr7\Utils;
@@ -138,6 +140,44 @@ describe('PSR-18 response bodies', function (): void {
         expect($response->getBody())->toBe($body)
             ->and($body->reads)->toBe(0)
             ->and($sink->all()[0]->responseBody->omittedReason)->toBe(CapturedBody::OMITTED_STREAMING);
+    });
+
+    it('never reads through a caching decorator whose source is still live', function (): void {
+        // CachingStream forwards getMetadata() to its php://temp cache, so it
+        // looks buffered while every read past the cached prefix pulls from
+        // the network source underneath.
+        $recorder = new Recorder(sink: $sink = new InMemorySink());
+        $sourceReads = 0;
+        $body = new CachingStream(new PumpStream(static function () use (&$sourceReads): string {
+            ++$sourceReads;
+
+            return "data: event\n\n";
+        }));
+
+        (new WiretapClient(psr18ReturningBody($body), $recorder))
+            ->sendRequest(new Request('GET', 'https://api.example.com/events'));
+
+        $recorder->flush();
+
+        expect($sourceReads)->toBe(0)
+            ->and($sink->all()[0]->responseBody->omittedReason)->toBe(CapturedBody::OMITTED_STREAMING);
+    });
+
+    it('still captures a body held in a local file', function (): void {
+        $path = tempnam(sys_get_temp_dir(), 'wiretap');
+        file_put_contents($path, '{"from":"file"}');
+        $recorder = new Recorder(sink: $sink = new InMemorySink());
+
+        try {
+            (new WiretapClient(psr18ReturningBody(Utils::streamFor(fopen($path, 'rb'))), $recorder))
+                ->sendRequest(new Request('GET', 'https://api.example.com/download'));
+        } finally {
+            @unlink($path);
+        }
+
+        $recorder->flush();
+
+        expect($sink->all()[0]->responseBody->bytes)->toBe('{"from":"file"}');
     });
 
     it('still captures a body the client has already buffered in memory', function (): void {

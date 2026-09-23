@@ -8,6 +8,7 @@ use Psr\Http\Client\ClientExceptionInterface;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamInterface;
 use Ssx\Wiretap\CapturedBody;
 use Ssx\Wiretap\Correlation;
 use Ssx\Wiretap\Exchange;
@@ -155,18 +156,24 @@ final readonly class WiretapClient implements ClientInterface
      * application wait for bytes it had not asked for yet: an SSE call that
      * returns in 0.01s took 3s, and an endless stream never returned.
      *
-     * A body in php://temp or php://memory has already been received in full
-     * and reading it cannot wait on the network. Anything else is recorded as
-     * streaming, the same answer the middleware gives for `stream => true`.
+     * A body held in php://temp, php://memory or a local file has already been
+     * received in full, and reading it cannot wait on the network. Anything
+     * else is recorded as streaming, the same answer the middleware gives for
+     * `stream => true`.
+     *
+     * The stream's own class is checked as well as its metadata. A decorator
+     * forwards getMetadata() to whatever it wraps: Guzzle's CachingStream
+     * reports its php://temp cache while every read past the cached prefix
+     * still pulls from the network. Only the plain resource-backed streams of
+     * the common PSR-7 implementations are trusted, compared by exact class so
+     * that a subclass adding its own read() is not.
      */
     private function captureResponseBody(ResponseInterface $response): CapturedBody
     {
         $body = $response->getBody();
         $contentType = $response->getHeaderLine('Content-Type') ?: null;
 
-        $uri = $body->getMetadata('uri');
-
-        if (!is_string($uri) || !(str_starts_with($uri, 'php://temp') || str_starts_with($uri, 'php://memory'))) {
+        if (!self::isAlreadyReceived($body)) {
             $size = $body->getSize();
 
             return CapturedBody::omitted(
@@ -177,5 +184,21 @@ final readonly class WiretapClient implements ClientInterface
         }
 
         return $this->bodyCapture->capture($body, $contentType);
+    }
+
+    private const PLAIN_STREAM_CLASSES = [
+        'GuzzleHttp\\Psr7\\Stream',
+        'Nyholm\\Psr7\\Stream',
+        'Laminas\\Diactoros\\Stream',
+    ];
+
+    private static function isAlreadyReceived(StreamInterface $body): bool
+    {
+        if (!in_array($body::class, self::PLAIN_STREAM_CLASSES, true)) {
+            return false;
+        }
+
+        return in_array($body->getMetadata('stream_type'), ['TEMP', 'MEMORY'], true)
+            || $body->getMetadata('wrapper_type') === 'plainfile';
     }
 }
