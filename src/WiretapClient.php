@@ -132,10 +132,7 @@ final readonly class WiretapClient implements ClientInterface
                 reason: $response?->getReasonPhrase() ?: null,
                 responseHeaders: $response !== null ? Headers::fromMap($response->getHeaders()) : Headers::empty(),
                 responseBody: $response !== null
-                    ? $this->bodyCapture->capture(
-                        $response->getBody(),
-                        $response->getHeaderLine('Content-Type') ?: null,
-                    )
+                    ? $this->captureResponseBody($response)
                     : CapturedBody::none(),
                 timings: Timings::fromElapsedSeconds(microtime(true) - $pending->startedAt),
                 error: $error,
@@ -146,5 +143,39 @@ final readonly class WiretapClient implements ClientInterface
         } catch (\Throwable) {
             // Never change application behaviour.
         }
+    }
+
+    /**
+     * Read the response body only if it is already sitting in memory.
+     *
+     * The Guzzle middleware knows whether the caller asked for a live stream;
+     * a PSR-18 client gives no such signal, and sendRequest() returns as soon
+     * as the headers arrive. Symfony's Psr18Client hands back a body that is
+     * still being received, so reading up to the capture limit here made the
+     * application wait for bytes it had not asked for yet: an SSE call that
+     * returns in 0.01s took 3s, and an endless stream never returned.
+     *
+     * A body in php://temp or php://memory has already been received in full
+     * and reading it cannot wait on the network. Anything else is recorded as
+     * streaming, the same answer the middleware gives for `stream => true`.
+     */
+    private function captureResponseBody(ResponseInterface $response): CapturedBody
+    {
+        $body = $response->getBody();
+        $contentType = $response->getHeaderLine('Content-Type') ?: null;
+
+        $uri = $body->getMetadata('uri');
+
+        if (!is_string($uri) || !(str_starts_with($uri, 'php://temp') || str_starts_with($uri, 'php://memory'))) {
+            $size = $body->getSize();
+
+            return CapturedBody::omitted(
+                CapturedBody::OMITTED_STREAMING,
+                $size !== null && $size >= 0 ? $size : null,
+                $contentType,
+            );
+        }
+
+        return $this->bodyCapture->capture($body, $contentType);
     }
 }
