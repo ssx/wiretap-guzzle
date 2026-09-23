@@ -24,8 +24,12 @@ covering the clients this package cannot see. The option is only added when
 wiretap-auto's hooks are running; otherwise request options are exactly what
 they would be without it.
 
-One exception: `WiretapClient`, the PSR-18 decorator, has no request options
-to carry the claim, so a Guzzle client behind it is recorded by both.
+`WiretapClient`, the PSR-18 decorator, claims too when the client it wraps is
+exactly `GuzzleHttp\Client`: it calls Guzzle's `send()` with the same options
+Guzzle's own `sendRequest()` uses (synchronous, no redirects, no HTTP-error
+exceptions) plus the claim, so behaviour is unchanged. Any other PSR-18
+client, including a subclass of Guzzle's, has no request options to carry
+it, and a call through it is recorded by both.
 
 ## Usage
 

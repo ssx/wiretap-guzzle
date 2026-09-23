@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Ssx\Wiretap\Guzzle;
 
+use GuzzleHttp\Client as GuzzleClient;
+use GuzzleHttp\RequestOptions;
 use Psr\Http\Client\ClientExceptionInterface;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestInterface;
@@ -16,6 +18,7 @@ use Ssx\Wiretap\Headers;
 use Ssx\Wiretap\Recorder;
 use Ssx\Wiretap\Support\Ulid;
 use Ssx\Wiretap\Timings;
+use Ssx\Wiretap\TransferClaim;
 use Ssx\Wiretap\TransferError;
 
 /**
@@ -66,6 +69,7 @@ final readonly class WiretapClient implements ClientInterface
         // it were inside, a failure in our own bookkeeping could be caught and
         // retried, and the application's request would be sent twice.
         $pending = null;
+        $claim = false;
 
         try {
             $recorder = $this->recorder();
@@ -91,9 +95,12 @@ final readonly class WiretapClient implements ClientInterface
                         $request->getHeaderLine('Content-Type') ?: null,
                     ),
                 );
+
+                $claim = TransferClaim::isHonoured() && $this->inner::class === GuzzleClient::class;
             }
         } catch (\Throwable) {
             $pending = null;
+            $claim = false;
         }
 
         if ($pending === null) {
@@ -101,7 +108,9 @@ final readonly class WiretapClient implements ClientInterface
         }
 
         try {
-            $response = $this->inner->sendRequest($request);
+            $response = $claim && $this->inner instanceof GuzzleClient
+                ? $this->inner->send($request, self::claimedSendRequestOptions())
+                : $this->inner->sendRequest($request);
         } catch (ClientExceptionInterface $e) {
             $this->record($pending, $request, $url, response: null, error: TransferError::fromThrowable($e));
 
@@ -111,6 +120,40 @@ final readonly class WiretapClient implements ClientInterface
         $this->record($pending, $request, $url, response: $response, error: null);
 
         return $response;
+    }
+
+    /**
+     * What Guzzle's own Client::sendRequest() passes to sendAsync(), plus the
+     * claim that tells ssx/wiretap-auto's curl hooks this request is
+     * recorded here.
+     *
+     * PSR-18 has no request options, so behind this decorator a Guzzle
+     * client could not carry the claim, and with wiretap-auto running every
+     * call was recorded twice. Guzzle's sendRequest() is
+     * `sendAsync($request, [synchronous, allow_redirects => false,
+     * http_errors => false])->wait()`, and send() is
+     * `sendAsync($request, $options + synchronous)->wait()`, in every 7.x
+     * release this package supports. So send() with these options is the same
+     * call — same redirect and error handling, same exceptions — with one
+     * extra request option. Psr18ClaimTest compares the two paths against
+     * the installed Guzzle, so a release that changed sendRequest() fails
+     * there rather than silently diverging.
+     *
+     * Only for exactly GuzzleHttp\Client, not a subclass: a subclass may
+     * override sendRequest(), and then send() is not what the application
+     * would have run. Guzzle marks the class @final, so the exact check costs
+     * nothing in practice.
+     *
+     * @return array<string, mixed>
+     */
+    private static function claimedSendRequestOptions(): array
+    {
+        return [
+            RequestOptions::SYNCHRONOUS => true,
+            RequestOptions::ALLOW_REDIRECTS => false,
+            RequestOptions::HTTP_ERRORS => false,
+            TransferClaim::KEY => true,
+        ];
     }
 
     private function record(

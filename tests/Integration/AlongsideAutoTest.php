@@ -113,3 +113,26 @@ it('records a redirected and a retried call once each', function (): void {
         ->and($this->sink->all())->toHaveCount(2)
         ->and(array_map(static fn ($e): string => $e->transport, $this->sink->all()))->toBe(['guzzle', 'guzzle']);
 });
+
+it('records a call through the PSR-18 decorator over Guzzle once', function (): void {
+    // PSR-18 has no request options, so the decorator could not carry the
+    // claim and the curl hooks recorded the same call again: 2 records.
+    $client = new \Ssx\Wiretap\Guzzle\WiretapClient(new Client(), static fn (): Recorder => Core::recorder());
+
+    $response = $client->sendRequest(new \GuzzleHttp\Psr7\Request('GET', $this->base . '/echo?psr18=1'));
+    $this->recorder->flush();
+
+    expect($response->getStatusCode())->toBe(200)
+        ->and($this->sink->all())->toHaveCount(1)
+        ->and($this->sink->all()[0]->transport)->toBe('psr18');
+});
+
+it('still leaves a redirect for the application to follow through the PSR-18 decorator', function (): void {
+    $client = new \Ssx\Wiretap\Guzzle\WiretapClient(new Client(), static fn (): Recorder => Core::recorder());
+
+    $response = $client->sendRequest(new \GuzzleHttp\Psr7\Request('GET', $this->base . '/redirect'));
+    $this->recorder->flush();
+
+    expect($response->getStatusCode())->toBe(302)
+        ->and($this->sink->all())->toHaveCount(1);
+});
