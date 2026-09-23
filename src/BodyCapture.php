@@ -128,7 +128,11 @@ final readonly class BodyCapture
 
             $sha256 = null;
 
-            if ($this->hashFullBody) {
+            // A body already known to be over the budget can never produce a
+            // digest, so hashing it only spent reads and CPU to reach null. A
+            // stream that overstates its size can only talk us out of hashing,
+            // never into reading more.
+            if ($this->hashFullBody && ($size === null || $size <= $this->maxHashBytes)) {
                 $sha256 = $this->hashRemaining($stream, $bytes . $overflow);
             }
 
@@ -203,6 +207,15 @@ final readonly class BodyCapture
 
             while (!$stream->eof()) {
                 if ($read >= $this->maxHashBytes) {
+                    // A stream at its last byte does not report eof until
+                    // something reads past it, so a body exactly the size of
+                    // the budget looks unfinished here. One more byte settles
+                    // it, as it does for the capture; the caller restores the
+                    // position either way.
+                    if ($stream->read(1) === '') {
+                        break;
+                    }
+
                     // Budget spent before the body ended.
                     return null;
                 }
