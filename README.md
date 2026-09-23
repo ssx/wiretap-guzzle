@@ -13,6 +13,20 @@ composer require ssx/wiretap-guzzle
 > [`ssx/wiretap-auto`](https://github.com/ssx/wiretap-auto), which hooks the
 > functions themselves and needs no application changes.
 
+## Alongside wiretap-auto
+
+Both can run in one process, and each call is still recorded once. The
+middleware claims the requests it records (a request option,
+`Ssx\Wiretap\TransferClaim::KEY`), Guzzle carries that to every redirect and
+retry hop, and wiretap-auto (v0.0.8 or later) records nothing for a claimed
+transfer. You get the middleware's record, with bodies, and wiretap-auto keeps
+covering the clients this package cannot see. The option is only added when
+wiretap-auto's hooks are running; otherwise request options are exactly what
+they would be without it.
+
+One exception: `WiretapClient`, the PSR-18 decorator, has no request options
+to carry the claim, so a Guzzle client behind it is recorded by both.
+
 ## Usage
 
 One line on a new client:

@@ -16,6 +16,7 @@ use Ssx\Wiretap\Correlation;
 use Ssx\Wiretap\Headers;
 use Ssx\Wiretap\Recorder;
 use Ssx\Wiretap\Support\Ulid;
+use Ssx\Wiretap\TransferClaim;
 use Ssx\Wiretap\TransferError;
 
 /**
@@ -136,7 +137,34 @@ final class WiretapMiddleware
         );
         $pending->streaming = $streaming;
 
-        return [$pending, $this->chainStatsHandler($options, $pending)];
+        return [$pending, self::claim($this->chainStatsHandler($options, $pending))];
+    }
+
+    /**
+     * Tell ssx/wiretap-auto's curl hooks that this request is recorded here.
+     *
+     * Without it, running both recorded every call twice, with no link
+     * between the records: once here, with bodies, and once by the hooks
+     * underneath. The claim is a request option, so Guzzle's redirect and
+     * retry middleware carry it to every hop, and the hooks read it where
+     * CurlFactory builds each hop's handle. It is never a `curl` option:
+     * Guzzle deprecates unknown ones from 7.12 and curl rejects them.
+     *
+     * Only when the hooks have said they read it. Otherwise the options are
+     * exactly what they were, and nothing is added for a request this
+     * middleware is not recording, so the hooks still see those.
+     *
+     * @param array<string, mixed> $options
+     *
+     * @return array<string, mixed>
+     */
+    private static function claim(array $options): array
+    {
+        if (TransferClaim::isHonoured() && !array_key_exists(TransferClaim::KEY, $options)) {
+            $options[TransferClaim::KEY] = true;
+        }
+
+        return $options;
     }
 
     /**
