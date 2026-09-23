@@ -159,7 +159,10 @@ final readonly class WiretapClient implements ClientInterface
      * A body held in php://temp, php://memory or a local file has already been
      * received in full, and reading it cannot wait on the network. Anything
      * else is recorded as streaming, the same answer the middleware gives for
-     * `stream => true`.
+     * `stream => true`. On this path it means "not shown to have been
+     * received": a fully buffered body from an unfamiliar PSR-7
+     * implementation is recorded that way too, which loses a body rather
+     * than stall a request.
      *
      * The stream's own class is checked as well as its metadata. A decorator
      * forwards getMetadata() to whatever it wraps: Guzzle's CachingStream
@@ -175,6 +178,11 @@ final readonly class WiretapClient implements ClientInterface
 
         if (!self::isAlreadyReceived($body)) {
             $size = $body->getSize();
+
+            // Known to be empty: nothing to wait for, and nothing to omit.
+            if ($size === 0) {
+                return CapturedBody::none();
+            }
 
             return CapturedBody::omitted(
                 CapturedBody::OMITTED_STREAMING,

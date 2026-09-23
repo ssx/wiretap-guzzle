@@ -5,6 +5,7 @@ declare(strict_types=1);
 use GuzzleHttp\Psr7\CachingStream;
 use GuzzleHttp\Psr7\PumpStream;
 use GuzzleHttp\Psr7\Request;
+use GuzzleHttp\Psr7\Stream;
 use GuzzleHttp\Psr7\Response;
 use GuzzleHttp\Psr7\Utils;
 use Psr\Http\Client\ClientInterface;
@@ -110,6 +111,52 @@ function liveNetworkStream(): StreamInterface
     };
 }
 
+/**
+ * A user-space stream wrapper standing in for Symfony's: every read would
+ * wait on the network. It reports no size, as Symfony does without a
+ * Content-Length.
+ */
+final class LiveNetworkWrapper
+{
+    public static int $reads = 0;
+
+    /** @var resource|null */
+    public $context;
+
+    public function stream_open(string $path, string $mode, int $options, ?string &$opened): bool
+    {
+        return true;
+    }
+
+    public function stream_read(int $count): string
+    {
+        ++self::$reads;
+
+        return "data: event\n\n";
+    }
+
+    public function stream_eof(): bool
+    {
+        return false;
+    }
+
+    public function stream_tell(): int
+    {
+        return 0;
+    }
+
+    public function stream_seek(int $offset, int $whence): bool
+    {
+        return true;
+    }
+
+    /** @return array<string, int> */
+    public function stream_stat(): array
+    {
+        return ['size' => -1];
+    }
+}
+
 function psr18ReturningBody(StreamInterface $body): ClientInterface
 {
     return new class($body) implements ClientInterface {
@@ -140,6 +187,60 @@ describe('PSR-18 response bodies', function (): void {
         expect($response->getBody())->toBe($body)
             ->and($body->reads)->toBe(0)
             ->and($sink->all()[0]->responseBody->omittedReason)->toBe(CapturedBody::OMITTED_STREAMING);
+    });
+
+    it('never reads a plain stream over a network resource, as Symfony returns it', function (): void {
+        // Symfony's Psr18Client wraps its response in a user-space stream
+        // resource and hands it back inside an ordinary GuzzleHttp\Psr7\Stream,
+        // so the class alone proves nothing: the resource type has to.
+        if (!in_array('wiretaplive', stream_get_wrappers(), true)) {
+            stream_wrapper_register('wiretaplive', LiveNetworkWrapper::class);
+        }
+
+        LiveNetworkWrapper::$reads = 0;
+        $recorder = new Recorder(sink: $sink = new InMemorySink());
+
+        (new WiretapClient(psr18ReturningBody(new Stream(fopen('wiretaplive://events', 'r'))), $recorder))
+            ->sendRequest(new Request('GET', 'https://api.example.com/events'));
+
+        $recorder->flush();
+
+        expect(LiveNetworkWrapper::$reads)->toBe(0)
+            ->and($sink->all()[0]->responseBody->omittedReason)->toBe(CapturedBody::OMITTED_STREAMING);
+    });
+
+    it('does not trust a subclass of a plain stream, which may read from anywhere', function (): void {
+        $recorder = new Recorder(sink: $sink = new InMemorySink());
+        $body = new class(fopen('php://temp', 'r+')) extends Stream {
+            public int $reads = 0;
+
+            public function read($length): string
+            {
+                ++$this->reads;
+
+                return parent::read($length);
+            }
+        };
+        $body->write('{"a":1}');
+
+        (new WiretapClient(psr18ReturningBody($body), $recorder))
+            ->sendRequest(new Request('GET', 'https://api.example.com/events'));
+
+        $recorder->flush();
+
+        expect($body->reads)->toBe(0);
+    });
+
+    it('records an empty body as empty, not as streaming', function (): void {
+        $recorder = new Recorder(sink: $sink = new InMemorySink());
+
+        (new WiretapClient(psr18ReturningBody(new PumpStream(static fn (): bool => false, ['size' => 0])), $recorder))
+            ->sendRequest(new Request('GET', 'https://api.example.com/empty'));
+
+        $recorder->flush();
+
+        expect($sink->all()[0]->responseBody->omittedReason)->toBeNull()
+            ->and($sink->all()[0]->responseBody->bytes)->toBeNull();
     });
 
     it('never reads through a caching decorator whose source is still live', function (): void {
