@@ -77,16 +77,34 @@ An existing `on_stats` callback is chained, not replaced.
 
 ## Completion signals
 
-Two are wired, because neither is sufficient alone:
+Two are wired, and they do different jobs:
 
 | Signal | Carries | Fires when |
 | --- | --- | --- |
-| `on_stats` | timings, effective URI after redirects, the response | inside `CurlFactory::finish()` — including for a promise nobody waits on |
-| promise handlers | the exception | when the promise settles |
+| `on_stats` | the request as sent, the effective URI, timings and response of one transfer | inside `CurlFactory::finish()`, once per transfer (every redirect hop and retry attempt) |
+| promise handlers | the final response, or the rejection reason | when the application's promise settles |
 
-Whichever arrives first writes the record; the other is a no-op. A rejection
-handler always returns `Create::rejectionFor($reason)` — returning anything
-else would turn a failure into a success for the calling code.
+Only the promise handlers write the record, once. `on_stats` folds each
+transfer in and gates it against the blocklist, but a hop is not the finished
+exchange. A promise nobody waits on, such as a Pool whose results are
+discarded, is therefore not recorded. A rejection handler always returns
+`Create::rejectionFor($reason)`; returning anything else would turn a failure
+into a success for the calling code. A rejection whose reason is not an
+exception is recorded as a failure, with its type but not its value.
+
+## Redirects and retries
+
+A redirect chain is one record. Its `uri`, method, headers and body are the
+first request actually sent, so a POST answered with a 302 is recorded as that
+POST, not as the GET that followed it. The status and response are the final
+hop's. Every later URI is listed, redacted, in `context.redirected_to`.
+Credentials carried by any hop, including one Guzzle stripped on a cross-host
+redirect, are learned and redacted everywhere in the record. If any hop goes to
+a blocked host, nothing is recorded.
+
+`timings.total` covers every transfer in the chain, retries included. The
+phase timings (`dns`, `connect`, `tls`, `ttfb`) are the first transfer's,
+measured from the start of the exchange.
 
 ## Licence
 
