@@ -153,6 +153,63 @@ describe('digests', function (): void {
 
         expect($result->sha256)->toBe(hash('sha256', $body));
     });
+
+    it('produces a digest for a body exactly the size of the budget', function (): void {
+        // A stream at its last byte does not report eof until something reads
+        // past it, so reaching the budget used to read as "the body did not
+        // end in time" for a body that ended exactly there.
+        $body = str_repeat('b', 1_048_576);
+
+        $result = (new BodyCapture(hashFullBody: true))->capture(Utils::streamFor($body), 'text/plain');
+
+        expect($result->sha256)->toBe(hash('sha256', $body))
+            ->and($result->truncated)->toBeFalse();
+    });
+
+    it('does the same for an unknown-length body exactly the size of the budget', function (): void {
+        $body = str_repeat('b', 1_048_576);
+
+        $result = (new BodyCapture(hashFullBody: true))->capture(unknownLengthStream($body), 'text/plain');
+
+        expect($result->sha256)->toBe(hash('sha256', $body));
+    });
+
+    it('still refuses a digest for one byte over the budget', function (): void {
+        $result = (new BodyCapture(maxBytes: 4, hashFullBody: true, maxHashBytes: 16))
+            ->capture(unknownLengthStream(str_repeat('c', 17)), 'text/plain');
+
+        expect($result->sha256)->toBeNull();
+    });
+
+    it('does not read past the capture for a body it already knows is over the budget', function (): void {
+        // A known size over the budget can never produce a digest, so hashing
+        // it only spent the reads (and the CPU) to reach the same null.
+        $inner = Utils::streamFor(str_repeat('d', 100));
+        $counting = new class($inner) implements StreamInterface {
+            use \GuzzleHttp\Psr7\StreamDecoratorTrait;
+
+            public int $bytesRead = 0;
+
+            public function __construct(private StreamInterface $stream)
+            {
+            }
+
+            public function read(int $length): string
+            {
+                $chunk = $this->stream->read($length);
+                $this->bytesRead += strlen($chunk);
+
+                return $chunk;
+            }
+        };
+
+        $result = (new BodyCapture(maxBytes: 4, hashFullBody: true, maxHashBytes: 16))
+            ->capture($counting, 'text/plain');
+
+        expect($result->sha256)->toBeNull()
+            ->and($result->bytes)->toBe('dddd')
+            ->and($counting->bytesRead)->toBe(4);
+    });
 });
 
 describe('truncation of unknown-length bodies', function (): void {
