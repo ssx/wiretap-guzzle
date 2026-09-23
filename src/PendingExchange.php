@@ -53,6 +53,8 @@ final class PendingExchange
 
     private bool $recorded = false;
 
+    private bool $blocked = false;
+
     public function __construct(
         private readonly \Ssx\Wiretap\Recorder $recorder,
         private readonly string $id,
@@ -229,6 +231,20 @@ final class PendingExchange
     public function isRecorded(): bool
     {
         return $this->recorded;
+    }
+
+    /**
+     * Some hop of this exchange went to a blocked URI. Permanent: a later hop
+     * back onto an allowed host does not make the blocked one capturable.
+     */
+    public function block(): void
+    {
+        $this->blocked = true;
+    }
+
+    public function isBlocked(): bool
+    {
+        return $this->blocked;
     }
 
     /**
