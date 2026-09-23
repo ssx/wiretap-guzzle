@@ -22,11 +22,11 @@ use Ssx\Wiretap\TransferError;
  * across those boundaries buys nothing but ceremony.
  *
  * Ordering note, because it is not obvious and it is easy to get wrong:
- * `on_stats` runs inside `CurlFactory::finish()`, which is *before* the
- * promise settles and therefore before any `then()` handler. Recording from
- * `then()` alone would miss a promise nobody waits on; recording from
- * `on_stats` alone would miss the exception class on a failure. So both call
- * `markRecorded()` and the first one to arrive wins.
+ * `on_stats` runs inside `CurlFactory::finish()` once per transfer — every
+ * redirect hop and retry attempt — and *before* the promise settles. It only
+ * folds that transfer's request, stats and timings in here. The record is
+ * written from the promise handlers, once the application's own promise
+ * settles; `markRecorded()` keeps that to a single write.
  */
 final class PendingExchange
 {
@@ -42,10 +42,24 @@ final class PendingExchange
 
     private Timings $timings;
 
+    /**
+     * How many transfers on_stats has reported: more than one for a redirect
+     * chain or a retry.
+     */
+    private int $transfers = 0;
+
+    /**
+     * The URI the recorded request was actually sent to: the first hop's, once
+     * on_stats has seen it. Null until then, when the application's URI
+     * stands in.
+     */
+    private ?string $sentUri = null;
+
     private ?TransferError $error = null;
 
     /**
-     * Every URI this exchange has been seen at, original first.
+     * Every URI this exchange was sent to or ended at, in order: each hop's
+     * request as sent, and each transfer's effective URI.
      *
      * @var list<string>
      */
@@ -86,7 +100,6 @@ final class PendingExchange
         $this->responseHeaders = Headers::empty();
         $this->responseBody = CapturedBody::none();
         $this->timings = new Timings();
-        $this->hops[] = $uri;
         $this->originalUri = $uri;
         $this->requests[] = [$uri, $requestHeaders];
     }
@@ -94,11 +107,12 @@ final class PendingExchange
     /**
      * The URI the application actually asked for.
      *
-     * This is what the recorded method, headers and body belong to, and it is
-     * what the redactor has to see: overwriting it with the effective URI
-     * after a redirect threw away the credentials in the original query
-     * string before the redactor could learn them, so a response echoing one
-     * back reached the sink in plaintext.
+     * Not necessarily a URI anything was sent to — a middleware below this
+     * one can move the request — but the redactor still has to see it:
+     * dropping it threw away the credentials in the query string the
+     * application built, so a response echoing one back reached the sink in
+     * plaintext. It stays in the requests learned from, and stands in as the
+     * recorded URI until on_stats reports the real one.
      */
     private readonly string $originalUri;
 
@@ -135,7 +149,7 @@ final class PendingExchange
     }
 
     /**
-     * Replace the recorded request with the one actually sent.
+     * Fold in a request that was actually sent: one per transfer.
      *
      * The middleware sits at the top of the handler stack so it never
      * decorates a body upstream of a signing middleware — but that also means
@@ -153,22 +167,36 @@ final class PendingExchange
      * plaintext.
      *
      * TransferStats::getRequest() is the request as sent, and on_stats fires
-     * for it even under Http::fake(). The original is not simply discarded:
-     * its URI is kept as the recorded one, because credentials in the query
-     * string the application built still have to be learned.
+     * for it even under Http::fake().
+     *
+     * Only the first transfer becomes the recorded request, URI, method,
+     * headers and body together. Taking the method, headers and body from
+     * every hop while keeping the original URI described a request nobody
+     * sent: a POST answered with a 302 is followed as a bodyless GET, and the
+     * record read "GET <the POST's URI>, no body". Later hops are listed in
+     * `redirected_to`. A retry resends the same request, so its first attempt
+     * describes it as well as the last.
+     *
+     * The body is read only for the first transfer, so $body is a closure.
+     *
+     * @param \Closure(): CapturedBody $body
      */
-    public function requestAsSent(RequestInterface $request, CapturedBody $body): void
+    public function requestAsSent(RequestInterface $request, \Closure $body): void
     {
-        $this->method = $request->getMethod();
-        $this->requestHeaders = Headers::fromMap($request->getHeaders());
-        $this->requestBody = $body;
-
         $sent = (string) $request->getUri();
+        $headers = Headers::fromMap($request->getHeaders());
 
-        // The recorded headers are replaced, but what this hop carried must
-        // still be learned: Guzzle strips Authorization on a cross-host
-        // redirect, and the token then echoed in the final body survived.
-        $this->requests[] = [$sent, $this->requestHeaders];
+        if ($this->sentUri === null) {
+            $this->sentUri = $sent;
+            $this->method = $request->getMethod();
+            $this->requestHeaders = $headers;
+            $this->requestBody = $body();
+        }
+
+        // What every hop carried must still be learned: Guzzle strips
+        // Authorization on a cross-host redirect, and the token then echoed
+        // in the final body survived.
+        $this->requests[] = [$sent, $headers];
 
         if (!in_array($sent, $this->hops, true)) {
             $this->hops[] = $sent;
@@ -191,9 +219,28 @@ final class PendingExchange
 
         $handlerStats = $stats->getHandlerStats();
 
-        $this->timings = isset($handlerStats['total_time'])
+        $timings = isset($handlerStats['total_time'])
             ? Timings::fromCurlInfo($handlerStats)
             : Timings::fromElapsedSeconds($stats->getTransferTime() ?? 0.0);
+
+        // A redirect chain or a retry is several transfers, and each one
+        // overwrote the last, so a chain that spent seconds on its first hops
+        // was reported as fast as its final one. The total is summed across
+        // them. The phase timings stay the first transfer's: they are offsets
+        // from its start, which is the start of the whole exchange, so they
+        // remain true for it — a later hop's would be offsets from a moment
+        // the record does not show.
+        $this->timings = $this->transfers++ === 0
+            ? $timings
+            : new Timings(
+                dns: $this->timings->dns,
+                connect: $this->timings->connect,
+                tls: $this->timings->tls,
+                ttfb: $this->timings->ttfb,
+                total: $this->timings->total === null && $timings->total === null
+                    ? null
+                    : ($this->timings->total ?? 0) + ($timings->total ?? 0),
+            );
 
         // A ConnectException carries no response, so the curl errno is the
         // only description of what went wrong.
@@ -285,12 +332,23 @@ final class PendingExchange
         // belong in `uri`, which has to agree with the recorded method,
         // headers and body. HopSecrets emits those URIs already redacted:
         // core does not walk a list in context.
+        //
+        // The application's URI is not a hop when a lower middleware moved
+        // the request before it was sent; it is still learned from, as one of
+        // the requests.
+        $uri = $this->recordedUri();
+
         return HopSecrets::apply(
             $this->recorder->redactor(),
             $this->baseExchange(),
-            array_values(array_slice($this->hops, 1)),
+            array_values(array_filter($this->hops, static fn (string $hop): bool => $hop !== $uri)),
             $this->requests,
         );
+    }
+
+    private function recordedUri(): string
+    {
+        return $this->sentUri ?? $this->originalUri;
     }
 
     private function baseExchange(): Exchange
@@ -300,7 +358,7 @@ final class PendingExchange
             correlationId: $this->correlationId,
             transport: Exchange::TRANSPORT_GUZZLE,
             method: $this->method,
-            uri: $this->originalUri,
+            uri: $this->recordedUri(),
             requestHeaders: $this->requestHeaders,
             requestBody: $this->requestBody,
             status: $this->status,

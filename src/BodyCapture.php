@@ -73,6 +73,13 @@ final readonly class BodyCapture
 
         $size = $stream->getSize();
 
+        // Some implementations report an unknown length as -1 rather than
+        // null. Taken as a size, a readable body was compared against it and
+        // stored as complete, with size -1.
+        if ($size !== null && $size < 0) {
+            $size = null;
+        }
+
         if ($size === 0) {
             return CapturedBody::none();
         }

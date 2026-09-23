@@ -30,15 +30,18 @@ use Ssx\Wiretap\TransferError;
  * null, Guzzle switches to `Transfer-Encoding: chunked` and some APIs reject
  * the request outright.
  *
- * Two completion signals are wired, because neither is sufficient alone:
+ * Two signals are wired, and they do different jobs:
  *
- * - `on_stats` fires inside `CurlFactory::finish()`, before the promise
- *   settles. It carries the transfer timings, the effective URI after
- *   redirects, and the response — and it still runs for a promise nobody ever
- *   waits on, such as a Pool whose results are discarded.
- * - The promise handlers carry the exception, which `on_stats` cannot see.
+ * - `on_stats` fires inside `CurlFactory::finish()` once per transfer — each
+ *   redirect hop and retry attempt — before the promise settles. It carries
+ *   the request as sent, the effective URI, the timings and the response of
+ *   that transfer, and gates each hop against the blocklist. It never writes
+ *   the record: a hop is not the finished exchange.
+ * - The promise handlers write the record, once, when the application's
+ *   promise settles, with the final response or the rejection reason.
  *
- * Whichever arrives first writes the record; the other is a no-op.
+ * A promise nobody ever waits on — a Pool whose results are discarded — is
+ * therefore not recorded.
  */
 final class WiretapMiddleware
 {
@@ -200,9 +203,13 @@ final class WiretapMiddleware
                             $pending->response($response, $this->captureResponseBody($pending, $response));
                         }
 
-                        if ($reason instanceof \Throwable) {
-                            $pending->error($this->errorFor($reason));
-                        }
+                        // A rejection is a failure whatever its reason.
+                        // One that is not a Throwable was recorded with no
+                        // error at all — with the server's 200 beside it, a
+                        // success the application never saw.
+                        $pending->error($reason instanceof \Throwable
+                            ? $this->errorFor($reason)
+                            : self::nonThrowableError($reason));
 
                         $this->commit($pending);
                     }
@@ -267,10 +274,12 @@ final class WiretapMiddleware
                 }
 
                 if (!$pending->isBlocked()) {
-                    $pending->requestAsSent($sent, $this->bodyCapture->capture(
+                    // Not $pending->streaming: `stream` is about the
+                    // response. Passing it here replaced a request body that
+                    // had already been captured with "omitted: streaming".
+                    $pending->requestAsSent($sent, fn (): CapturedBody => $this->bodyCapture->capture(
                         $sent->getBody(),
                         $sent->getHeaderLine('Content-Type') ?: null,
-                        $pending->streaming,
                     ));
 
                     $pending->stats($stats);
@@ -326,6 +335,21 @@ final class WiretapMiddleware
         }
 
         return TransferError::fromThrowable($reason);
+    }
+
+    /**
+     * A rejection whose reason is not an exception: a middleware calling
+     * `Create::rejectionFor('circuit-open')`, say. Guzzle wraps it in a
+     * RejectionException only for a caller that waits, so the handler sees
+     * the raw value. The value is application data and is not kept, only its
+     * type.
+     */
+    private static function nonThrowableError(mixed $reason): TransferError
+    {
+        return new TransferError(
+            errno: -1,
+            message: sprintf('Promise rejected with a %s reason, not an exception', get_debug_type($reason)),
+        );
     }
 
     private function commit(PendingExchange $pending): void
