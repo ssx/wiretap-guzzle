@@ -51,6 +51,23 @@ final class PendingExchange
      */
     private array $hops = [];
 
+    /**
+     * Every request observed for this exchange — the one the application
+     * built, then each one actually sent — as URI and headers. Held only so
+     * redaction can learn what each hop carried; never stored.
+     *
+     * @var list<array{0: string, 1: Headers}>
+     */
+    private array $requests = [];
+
+    /**
+     * The response the most recent transfer received, if any. A middleware
+     * below this one can turn a received response into an exception that
+     * carries none, and this is then the only record of what the server
+     * sent.
+     */
+    private ?ResponseInterface $transferResponse = null;
+
     private bool $recorded = false;
 
     private bool $blocked = false;
@@ -71,6 +88,7 @@ final class PendingExchange
         $this->timings = new Timings();
         $this->hops[] = $uri;
         $this->originalUri = $uri;
+        $this->requests[] = [$uri, $requestHeaders];
     }
 
     /**
@@ -147,6 +165,11 @@ final class PendingExchange
 
         $sent = (string) $request->getUri();
 
+        // The recorded headers are replaced, but what this hop carried must
+        // still be learned: Guzzle strips Authorization on a cross-host
+        // redirect, and the token then echoed in the final body survived.
+        $this->requests[] = [$sent, $this->requestHeaders];
+
         if (!in_array($sent, $this->hops, true)) {
             $this->hops[] = $sent;
         }
@@ -163,6 +186,8 @@ final class PendingExchange
         if (!in_array($this->uri, $this->hops, true)) {
             $this->hops[] = $this->uri;
         }
+
+        $this->transferResponse = $stats->hasResponse() ? $stats->getResponse() : null;
 
         $handlerStats = $stats->getHandlerStats();
 
@@ -233,6 +258,11 @@ final class PendingExchange
         return $this->recorded;
     }
 
+    public function transferResponse(): ?ResponseInterface
+    {
+        return $this->transferResponse;
+    }
+
     /**
      * Some hop of this exchange went to a blocked URI. Permanent: a later hop
      * back onto an allowed host does not make the blocked one capturable.
@@ -247,24 +277,23 @@ final class PendingExchange
         return $this->blocked;
     }
 
-    /**
-     * Where the request ended up, when that is not where it started.
-     *
-     * The effective URI is worth keeping — it is the whole point of following
-     * a redirect — but it does not belong in `uri`, which has to agree with
-     * the recorded method, headers and body. Context is redacted like
-     * everything else, so credentials in a redirect target are not exempt.
-     *
-     * @return array<array-key, mixed>
-     */
-    private function context(): array
+    public function toExchange(): Exchange
     {
-        $redirects = array_values(array_slice($this->hops, 1));
-
-        return $redirects === [] ? [] : ['redirected_to' => $redirects];
+        // Where the request ended up, when that is not where it started, goes
+        // in context as `redirected_to`. The effective URI is worth keeping —
+        // it is the whole point of following a redirect — but it does not
+        // belong in `uri`, which has to agree with the recorded method,
+        // headers and body. HopSecrets emits those URIs already redacted:
+        // core does not walk a list in context.
+        return HopSecrets::apply(
+            $this->recorder->redactor(),
+            $this->baseExchange(),
+            array_values(array_slice($this->hops, 1)),
+            $this->requests,
+        );
     }
 
-    public function toExchange(): Exchange
+    private function baseExchange(): Exchange
     {
         return new Exchange(
             id: $this->id,
@@ -281,7 +310,6 @@ final class PendingExchange
             timings: $this->timings,
             error: $this->error,
             startedAt: $this->startedAt,
-            context: $this->context(),
             sequence: $this->sequence,
             pid: getmypid() ?: null,
         );
