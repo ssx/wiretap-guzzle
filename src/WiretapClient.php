@@ -8,6 +8,7 @@ use Psr\Http\Client\ClientExceptionInterface;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\StreamInterface;
 use Ssx\Wiretap\CapturedBody;
 use Ssx\Wiretap\Correlation;
 use Ssx\Wiretap\Exchange;
@@ -132,10 +133,7 @@ final readonly class WiretapClient implements ClientInterface
                 reason: $response?->getReasonPhrase() ?: null,
                 responseHeaders: $response !== null ? Headers::fromMap($response->getHeaders()) : Headers::empty(),
                 responseBody: $response !== null
-                    ? $this->bodyCapture->capture(
-                        $response->getBody(),
-                        $response->getHeaderLine('Content-Type') ?: null,
-                    )
+                    ? $this->captureResponseBody($response)
                     : CapturedBody::none(),
                 timings: Timings::fromElapsedSeconds(microtime(true) - $pending->startedAt),
                 error: $error,
@@ -146,5 +144,69 @@ final readonly class WiretapClient implements ClientInterface
         } catch (\Throwable) {
             // Never change application behaviour.
         }
+    }
+
+    /**
+     * Read the response body only if it is already sitting in memory.
+     *
+     * The Guzzle middleware knows whether the caller asked for a live stream;
+     * a PSR-18 client gives no such signal, and sendRequest() returns as soon
+     * as the headers arrive. Symfony's Psr18Client hands back a body that is
+     * still being received, so reading up to the capture limit here made the
+     * application wait for bytes it had not asked for yet: an SSE call that
+     * returns in 0.01s took 3s, and an endless stream never returned.
+     *
+     * A body held in php://temp, php://memory or a local file has already been
+     * received in full, and reading it cannot wait on the network. Anything
+     * else is recorded as streaming, the same answer the middleware gives for
+     * `stream => true`. On this path it means "not shown to have been
+     * received": a fully buffered body from an unfamiliar PSR-7
+     * implementation is recorded that way too, which loses a body rather
+     * than stall a request.
+     *
+     * The stream's own class is checked as well as its metadata. A decorator
+     * forwards getMetadata() to whatever it wraps: Guzzle's CachingStream
+     * reports its php://temp cache while every read past the cached prefix
+     * still pulls from the network. Only the plain resource-backed streams of
+     * the common PSR-7 implementations are trusted, compared by exact class so
+     * that a subclass adding its own read() is not.
+     */
+    private function captureResponseBody(ResponseInterface $response): CapturedBody
+    {
+        $body = $response->getBody();
+        $contentType = $response->getHeaderLine('Content-Type') ?: null;
+
+        if (!self::isAlreadyReceived($body)) {
+            $size = $body->getSize();
+
+            // Known to be empty: nothing to wait for, and nothing to omit.
+            if ($size === 0) {
+                return CapturedBody::none();
+            }
+
+            return CapturedBody::omitted(
+                CapturedBody::OMITTED_STREAMING,
+                $size !== null && $size >= 0 ? $size : null,
+                $contentType,
+            );
+        }
+
+        return $this->bodyCapture->capture($body, $contentType);
+    }
+
+    private const PLAIN_STREAM_CLASSES = [
+        'GuzzleHttp\\Psr7\\Stream',
+        'Nyholm\\Psr7\\Stream',
+        'Laminas\\Diactoros\\Stream',
+    ];
+
+    private static function isAlreadyReceived(StreamInterface $body): bool
+    {
+        if (!in_array($body::class, self::PLAIN_STREAM_CLASSES, true)) {
+            return false;
+        }
+
+        return in_array($body->getMetadata('stream_type'), ['TEMP', 'MEMORY'], true)
+            || $body->getMetadata('wrapper_type') === 'plainfile';
     }
 }
