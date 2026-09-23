@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ssx\Wiretap\Guzzle;
 
 use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Exception\TransferException;
 use GuzzleHttp\Promise\Create;
 use GuzzleHttp\Promise\PromiseInterface;
 use GuzzleHttp\TransferStats;
@@ -163,6 +164,12 @@ final class WiretapMiddleware
                         if ($reason instanceof RequestException && $reason->getResponse() !== null) {
                             $response = $reason->getResponse();
                             $pending->response($response, $this->captureResponseBody($pending, $response));
+                        } elseif (($response = $pending->transferResponse()) !== null) {
+                            // The server answered, and a middleware below
+                            // this one turned that answer into an exception
+                            // that carries no response. Without this the
+                            // status the server sent was lost.
+                            $pending->response($response, $this->captureResponseBody($pending, $response));
                         }
 
                         if ($reason instanceof \Throwable) {
@@ -272,6 +279,20 @@ final class WiretapMiddleware
             return new TransferError(
                 errno: 0,
                 message: sprintf('HTTP %d response', $response->getStatusCode()),
+                class: $reason::class,
+            );
+        }
+
+        // Anything that is not one of Guzzle's transfer exceptions was raised
+        // by code, not by the transport: typically a middleware below this
+        // one turning a response it disliked into an exception. Its message
+        // is arbitrary text, and in practice it often embeds the response
+        // body — stored here, that bypassed every body-path rule. The class
+        // says what happened; the message is not kept.
+        if (!$reason instanceof TransferException) {
+            return new TransferError(
+                errno: -1,
+                message: 'Exception message not recorded: raised by code, not by the transport',
                 class: $reason::class,
             );
         }
